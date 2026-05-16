@@ -6875,9 +6875,11 @@
     return ingredientType === "REFERENCE" || ingredientType === "INGREDIENT";
   }
 
-  function buildIngredient(imageId, type) {
+  function buildIngredient(imageId, type, meta = {}) {
     return {
-      imageId,
+      imageId: String(imageId || "").trim(),
+      title: String(meta.title || meta.fileName || "").trim(),
+      fileName: String(meta.fileName || meta.title || "").trim(),
       isLoading: false,
       addedTime: new Date().toISOString(),
       modifiedTime: new Date().toISOString(),
@@ -7124,18 +7126,19 @@
   }
 
   function setRoleIngredient(store, imageId = "", ingredientType = "FIRST_FRAME") {
-    const id = String(imageId || "").trim();
+    const meta = imageId && typeof imageId === "object" ? imageId : { imageId: String(imageId || "").trim() };
+    const id = meta.imageId;
     const state = store?.getState?.();
     if (!id || !state) return false;
     if (frameIdsMatch(roleImageId(store, ingredientType), id)) return true;
     const current = Array.isArray(state.ingredients) ? state.ingredients : [];
     const next = [
       ...current.filter((ingredient) => ingredient?.preferredIngredientType !== ingredientType),
-      buildIngredient(id, ingredientType)
+      buildIngredient(id, ingredientType, meta)
     ];
     try {
       if (typeof state.actions?.addIngredient === "function") {
-        state.actions.addIngredient(buildIngredient(id, ingredientType));
+        state.actions.addIngredient(buildIngredient(id, ingredientType, meta));
         if (frameIdsMatch(roleImageId(store, ingredientType), id)) return true;
       }
       if (typeof state.actions?.setIngredients === "function") {
@@ -7157,15 +7160,16 @@
   }
 
   function addReferenceIngredient(store, imageId = "", ingredientType = "REFERENCE") {
-    const id = String(imageId || "").trim();
+    const meta = imageId && typeof imageId === "object" ? imageId : { imageId: String(imageId || "").trim() };
+    const id = meta.imageId;
     const state = store?.getState?.();
     if (!id || !state) return false;
     if (hasIngredientImageId(store, id)) return true;
     const current = Array.isArray(state.ingredients) ? state.ingredients : [];
-    const next = [...current, buildIngredient(id, ingredientType)];
+    const next = [...current, buildIngredient(id, ingredientType, meta)];
     try {
       if (typeof state.actions?.addIngredient === "function") {
-        state.actions.addIngredient(buildIngredient(id, ingredientType));
+        state.actions.addIngredient(buildIngredient(id, ingredientType, meta));
         if (hasIngredientImageId(store, id)) return true;
       }
       if (typeof state.actions?.setIngredients === "function") {
@@ -7223,11 +7227,12 @@
   }
 
   function setReferenceIngredients(store, imageIds = [], ingredientType = "REFERENCE") {
-    const ids = [...new Set(imageIds.map((id) => String(id || "").trim()).filter(Boolean))];
+    const descriptors = (Array.isArray(imageIds) ? imageIds : []).map((val) => (val && typeof val === "object" ? val : { imageId: String(val || "").trim() }));
+    const ids = [...new Set(descriptors.map((d) => d.imageId).filter(Boolean))];
     const state = store?.getState?.();
     if (!ids.length || !state) return false;
     const type = isReferenceLikeIngredientType(ingredientType) ? ingredientType : "REFERENCE";
-    const next = ids.map((id) => buildIngredient(id, type));
+    const next = descriptors.filter((d) => d.imageId).map((d) => buildIngredient(d.imageId, type, d));
     const setDirect = () => {
       if (typeof store.setState !== "function") return false;
       store.setState({ ingredients: next });
@@ -7290,7 +7295,8 @@
   }
 
   async function setReferenceIngredientsWithRetry(store, imageIds = [], options = {}) {
-    const ids = [...new Set(imageIds.map((id) => String(id || "").trim()).filter(Boolean))];
+    const descriptors = (Array.isArray(imageIds) ? imageIds : []).map((val) => (val && typeof val === "object" ? val : { imageId: String(val || "").trim() }));
+    const ids = [...new Set(descriptors.map((d) => d.imageId).filter(Boolean))];
     const ingredientType = isReferenceLikeIngredientType(options.ingredientType) ? options.ingredientType : "REFERENCE";
     const timeoutMs = Math.max(400, Number(options.timeoutMs || 1800) || 1800);
     const intervalMs = Math.max(100, Number(options.intervalMs || 220) || 220);
@@ -7300,11 +7306,13 @@
     let missing = ids;
     let ok = false;
     do {
-      ok = setReferenceIngredients(store, ids, ingredientType);
+      ok = setReferenceIngredients(store, descriptors, ingredientType);
       await sleep(intervalMs);
       finalIngredients = (store?.getState?.()?.ingredients || []).map((ingredient) => ({
         imageId: String(ingredient?.imageId || "").trim(),
-        preferredIngredientType: String(ingredient?.preferredIngredientType || "").trim()
+        preferredIngredientType: String(ingredient?.preferredIngredientType || "").trim(),
+        title: String(ingredient?.title || "").trim(),
+        fileName: String(ingredient?.fileName || "").trim()
       })).filter((ingredient) => ingredient.imageId);
       finalIds = finalIngredients.map((ingredient) => ingredient.imageId);
       missing = ids.filter((targetId) => !finalIds.some((actualId) => idsMatch(actualId, targetId)));
@@ -8020,14 +8028,16 @@
 
     const canBatchStoreReferenceRefs = !debuggerTransport && (mode === "ingredients-to-video" || mode === "text-to-image");
     if (canBatchStoreReferenceRefs) {
-      const targets = refs.map((ref) => referenceStoreImageIdForRef(ref));
-      if (targets.length === refs.length && targets.every(Boolean)) {
+      const targets = refs.map((ref) => ({ ...ref, imageId: referenceStoreImageIdForRef(ref) }));
+      if (targets.length === refs.length && targets.every((t) => t.imageId)) {
         const batchIngredientType = mode === "ingredients-to-video" ? "INGREDIENT" : "REFERENCE";
         const directAttach = { ok: setReferenceIngredients(store, targets, batchIngredientType) };
         const immediateOk = Boolean(directAttach.ok);
         const finalIngredients = (store.getState().ingredients || []).map((ingredient) => ({
           imageId: String(ingredient?.imageId || "").trim(),
-          preferredIngredientType: String(ingredient?.preferredIngredientType || "").trim()
+          preferredIngredientType: String(ingredient?.preferredIngredientType || "").trim(),
+          title: String(ingredient?.title || "").trim(),
+          fileName: String(ingredient?.fileName || "").trim()
         })).filter((ingredient) => ingredient.imageId);
         const finalIds = finalIngredients.map((ingredient) => ingredient.imageId);
         const missing = targets.filter((targetId) => !finalIds.some((actualId) => idsMatch(actualId, targetId)));
@@ -8130,11 +8140,15 @@
           batchUpload
         };
       }
-      const uploadedImageIds = uploadedOutcomes
+      const uploadedImageDescriptors = uploadedOutcomes
         .sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0))
-        .map((outcome) => outcome?.assetImageId || outcome?.confirmedImageId || (outcome?.mediaId ? `fe_id_${frameIdTail(outcome.mediaId) || outcome.mediaId}` : ""))
-        .map((id) => String(id || "").trim())
-        .filter(Boolean);
+        .map((outcome) => {
+          const ref = refs[Number(outcome?.index || 0)] || {};
+          const imageId = outcome?.assetImageId || outcome?.confirmedImageId || (outcome?.mediaId ? `fe_id_${frameIdTail(outcome.mediaId) || outcome.mediaId}` : "");
+          return { ...ref, imageId: String(imageId || "").trim() };
+        })
+        .filter((d) => d.imageId);
+      const uploadedImageIds = uploadedImageDescriptors.map((d) => d.imageId);
       emitAttachStage("ref_attach_project_add_media_batch_prompt_attach_start", {
         refCount: refs.length,
         uploadedMediaIds: uploadedOutcomes.map((outcome) => outcome?.mediaId || outcome?.uploadedMediaId || "").filter(Boolean),
@@ -8145,7 +8159,7 @@
         .sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0))
         .map((outcome) => String(outcome?.mediaId || outcome?.uploadedMediaId || "").trim())
         .filter(Boolean);
-      const directUploadedAttach = await setReferenceIngredientsWithRetry(store, uploadedImageIds, {
+      const directUploadedAttach = await setReferenceIngredientsWithRetry(store, uploadedImageDescriptors, {
         ingredientType: batchIngredientType,
         timeoutMs: 2600,
         intervalMs: 180
@@ -8920,6 +8934,8 @@
     return (Array.isArray(state.ingredients) ? state.ingredients : []).map((ingredient) => ({
       imageId: String(ingredient?.imageId || ingredient?.mediaId || "").trim(),
       preferredIngredientType: String(ingredient?.preferredIngredientType || "").trim(),
+      title: String(ingredient?.title || "").trim(),
+      fileName: String(ingredient?.fileName || "").trim(),
       isLoading: Boolean(ingredient?.isLoading)
     })).filter((ingredient) => ingredient.imageId);
   }

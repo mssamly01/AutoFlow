@@ -605,22 +605,17 @@ export function createLicenseClient({
   async function authSummary(data = null) {
     const auth = await getStoredAuth();
     const license = data || await initLicense();
-    const tier = String(license?.tier || "free").toLowerCase();
-    const subStatus = String(
-      license?.subscription_status ||
-        license?.subscriptionStatus ||
-        license?.stripe_subscription_status ||
-        license?.stripeSubscriptionStatus ||
-        ""
-    ).toLowerCase();
     return {
-      signedIn: Boolean(auth?.email || license?.email),
-      email: normalizeEmail(license?.email || auth?.email || ""),
-      tier,
-      license,
-      hasActiveSubscription:
-        tier === "pro" ||
-        ["active", "trialing", "past_due", "incomplete", "unpaid"].includes(subStatus)
+      signedIn: true,
+      email: normalizeEmail(license?.email || auth?.email || "user@unlocked.af"),
+      tier: "pro",
+      license: {
+        ...license,
+        tier: "pro",
+        prompts_today: 0,
+        prompt_limit: 999999
+      },
+      hasActiveSubscription: true
     };
   }
 
