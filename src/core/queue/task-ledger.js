@@ -139,15 +139,6 @@ export function createTaskLedger(initialTasks = []) {
       ...task,
       status: task.status || TaskStatus.pending,
       attempts: Number(task.attempts || 0),
-
-      // Progress / overlap runtime fields
-      progressPercent: Number.isFinite(Number(task.progressPercent))
-        ? Number(task.progressPercent)
-        : 0,
-      generatingStartedAt: task.generatingStartedAt || "",
-      overlapGateOpenedAt: task.overlapGateOpenedAt || "",
-      overlapGateOpened: task.overlapGateOpened === true,
-
       mediaIds: Array.isArray(task.mediaIds) ? [...task.mediaIds] : [],
       refMediaIds: Array.isArray(task.refMediaIds) ? [...task.refMediaIds] : [],
       refInputs: Array.isArray(task.refInputs) ? task.refInputs.map((ref) => ({ ...ref })) : [],
@@ -199,12 +190,6 @@ export function createTaskLedger(initialTasks = []) {
         submitAttemptStartedAt: "",
         submittedAt: "",
         completedAt: "",
-
-        // Progress / overlap runtime fields
-        progressPercent: 0,
-        generatingStartedAt: "",
-        overlapGateOpenedAt: "",
-        overlapGateOpened: false,
 
         // Reset lỗi.
         lastError: "",

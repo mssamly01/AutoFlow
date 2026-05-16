@@ -1025,14 +1025,6 @@ export function renderSettings(root, state) {
       numberInput("maxInitialWaitTime", presets.maxInitialWaitTime, "maxInitialWaitTime", { min: "1" })
     ),
 
-    subheader("queue_play_next", "Queue Overlap"),
-    field("Enable overlap generation:", controlGroup(checkInput("queueOverlapEnabledCheckbox", presets.queueOverlapEnabled, "queueOverlapEnabled"))),
-    field("Max concurrent tasks:", select("queueMaxConcurrentTasksInput", presets.queueMaxConcurrentTasks, [["1", "1 — Safe"], ["2", "2 — Recommended"], ["3", "3 — Aggressive"]], "queueMaxConcurrentTasks")),
-    field("Overlap trigger:", select("queueOverlapModeInput", presets.queueOverlapMode, [["time", "Time estimate"], ["progress", "API progress"]], "queueOverlapMode")),
-    field("Start next task at (%):", controlGroup(numberInput("queueOverlapStartPercentInput", presets.queueOverlapStartPercent, "queueOverlapStartPercent", { min: "10", max: "90", step: "5" }))),
-    field("Estimated image time (sec):", controlGroup(numberInput("estimatedImageGenerateSecondsInput", presets.estimatedImageGenerateSeconds, "estimatedImageGenerateSeconds", { min: "10", max: "600", step: "5" }))),
-    field("Estimated video time (sec):", controlGroup(numberInput("estimatedVideoGenerateSecondsInput", presets.estimatedVideoGenerateSeconds, "estimatedVideoGenerateSeconds", { min: "30", max: "1800", step: "10" }))),
-
     subheader("download", "Download Settings"),
     field("Auto-download videos:", controlGroup(checkInput("autoDownloadCheckbox", presets.autoDownload, "autoDownload"))),
     field("Video Resolution:", select("videoDownloadResolution", presets.videoDownloadResolution, [["720p", "Original (720p)"], ["1080p", "Upscaled (1080p)"], ["4k", "Upscaled (4K - 50 credits)"]], "videoDownloadResolution")),
@@ -1704,11 +1696,7 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
         : null
     ),
     renderLiveQueueOutputStrip(item, selected, locale),
-    el("span", { 
-      class: `live-task-activity${isErrorState ? " is-error" : ""}`, 
-      attrs: { title: activityTitle }, 
-      text: (item.progressPercent > 0 && status === "generating") ? `${label} (${Math.round(item.progressPercent)}%)` : label 
-    }),
+    el("span", { class: `live-task-activity${isErrorState ? " is-error" : ""}`, attrs: { title: activityTitle }, text: label }),
     el("span", { class: "live-task-progress", text: `${Math.min(resultCount, expectedCount)}/${expectedCount}` }),
     el("span", { class: `live-task-dot status-${status}` })
   );

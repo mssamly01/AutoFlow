@@ -100,86 +100,6 @@ export function classifyQueueError(error) {
   return { class: "unknown", retryable: true, healAction: "bounded_retry", scope: "task" };
 }
 
-export function isSubmittingOrGeneratingTask(task = {}) {
-  return [TaskStatus.submitting, TaskStatus.generating].includes(task.status);
-}
-
-export function isDownloadingTask(task = {}) {
-  return task.status === TaskStatus.downloading;
-}
-
-export function isActiveQueueTask(task = {}) {
-  return [
-    TaskStatus.submitting,
-    TaskStatus.generating,
-    TaskStatus.downloading
-  ].includes(task.status);
-}
-
-export function taskMediaKind(task = {}) {
-  const mode = String(task.mode || "");
-  if (mode === "text-to-image") return "images";
-  return "videos";
-}
-
-export function estimatedGenerateSecondsForTask(task = {}, queueSettings = {}) {
-  return taskMediaKind(task) === "images"
-    ? Number(queueSettings.estimatedImageGenerateSeconds || 60)
-    : Number(queueSettings.estimatedVideoGenerateSeconds || 180);
-}
-
-export function hasReachedOverlapGate(task = {}, queueSettings = {}, nowMs = Date.now()) {
-  const overlapMode = String(queueSettings.overlapMode || "time");
-  if (overlapMode === "off") return false;
-
-  const gatePercent = Math.max(
-    1,
-    Math.min(99, Number(queueSettings.overlapStartPercent || 50) || 50)
-  );
-
-  // Prefer real API progress when available.
-  if (overlapMode === "progress") {
-    const progress = Number(task.progressPercent || 0);
-    if (progress > 0) {
-      return progress >= gatePercent;
-    }
-  }
-
-  const startedAtMs = new Date(
-    task.generatingStartedAt || task.submittedAt || task.submitAttemptStartedAt || 0
-  ).getTime();
-
-  if (!startedAtMs || Number.isNaN(startedAtMs)) return false;
-
-  const elapsedMs = Math.max(0, nowMs - startedAtMs);
-  const estimatedSeconds = Math.max(1, estimatedGenerateSecondsForTask(task, queueSettings));
-  const gateMs = estimatedSeconds * 1000 * (gatePercent / 100);
-
-  return elapsedMs >= gateMs;
-}
-
-export function canStartAnotherTask(tasks = [], queueSettings = {}, nowMs = Date.now()) {
-  const maxGeneratingTasks = Math.max(1, Number(queueSettings.queueConcurrency || 1) || 1);
-  const maxDownloadingTasks = Math.max(1, Number(queueSettings.maxDownloadingTasks || 3) || 3);
-
-  const submittingOrGenerating = tasks.filter(isSubmittingOrGeneratingTask);
-  const downloading = tasks.filter(isDownloadingTask);
-
-  if (submittingOrGenerating.length >= maxGeneratingTasks) return false;
-  if (downloading.length >= maxDownloadingTasks) return false;
-
-  // Nếu không có task active, cho chạy task đầu tiên ngay.
-  if (!submittingOrGenerating.length) return true;
-
-  // Nếu đang có active task, chỉ mở task tiếp theo khi có ít nhất 1 task đã qua gate.
-  return submittingOrGenerating.some((task) => hasReachedOverlapGate(task, queueSettings, nowMs));
-}
-
-export function nextPendingTaskForOverlap(tasks = [], queueSettings = {}, nowMs = Date.now()) {
-  if (!canStartAnotherTask(tasks, queueSettings, nowMs)) return null;
-  return tasks.find((task) => task.status === TaskStatus.pending) || null;
-}
-
 export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
   if (!ledger) throw new Error("Scheduler requires a task ledger");
 
@@ -222,8 +142,7 @@ export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
         failedOutputCount: 0,
         failedOutputMediaIds: [],
         ...mediaPatch,
-        submittedAt: task.submittedAt || new Date().toISOString(),
-        generatingStartedAt: task.generatingStartedAt || new Date().toISOString(),
+        submittedAt: new Date().toISOString(),
         lastError: "",
         failureClass: "",
         healAction: "",
