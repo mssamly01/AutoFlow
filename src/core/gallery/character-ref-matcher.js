@@ -33,7 +33,29 @@ export function getRefInputFileName(ref = {}) {
 export function inferFirstCharacterNameFromPrompt(prompt = "") {
   const text = String(prompt || "").trim();
 
-  // Match text before "("
+  // 1. Support "Character: Name (details)"
+  const characterLabelMatch = text.match(
+    /(?:^|[\n.])\s*Character\s*:\s*([^(\n.]{1,80})\s*\(/iu
+  );
+  if (characterLabelMatch?.[1]) {
+    return characterLabelMatch[1]
+      .trim()
+      .normalize("NFC")
+      .replace(/\s+/g, " ");
+  }
+
+  // 2. Support "Nhân vật: Name (chi tiết)"
+  const vietnameseLabelMatch = text.match(
+    /(?:^|[\n.])\s*Nhân\s*vật\s*:\s*([^(\n.]{1,80})\s*\(/iu
+  );
+  if (vietnameseLabelMatch?.[1]) {
+    return vietnameseLabelMatch[1]
+      .trim()
+      .normalize("NFC")
+      .replace(/\s+/g, " ");
+  }
+
+  // 3. Fallback: text before the first "("
   const match = text.match(/^(.{1,80}?)\s*\(/u);
   if (match?.[1]) {
     return match[1].trim().normalize("NFC").replace(/\s+/g, " ");
@@ -41,6 +63,7 @@ export function inferFirstCharacterNameFromPrompt(prompt = "") {
 
   return "";
 }
+
 
 /**
  * Collects all character names associated with a task.

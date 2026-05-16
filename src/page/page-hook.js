@@ -157,19 +157,22 @@
     await sleep(150);
 
     result.click();
-    await sleep(300);
+    await sleep(500);
 
-    const chipAfterClick = findReferenceChipByFileName(fileName);
-    if (chipAfterClick) return;
+    if (findReferenceChipByFileName(fileName)) {
+      return;
+    }
 
     const input = getPromptInput();
-    input?.dispatchEvent(new KeyboardEvent("keydown", {
-      key: "Enter",
-      code: "Enter",
-      bubbles: true
-    }));
+    input?.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        bubbles: true
+      })
+    );
 
-    await sleep(300);
+    await sleep(500);
   }
 
   async function insertReferenceChipByMention(fileName, emitDomStage = () => {}) {
@@ -220,7 +223,12 @@
     }).filter(m => m.index >= 0).sort((a, b) => a.index - b.index);
 
     if (!matches.length) {
-      throw new Error(`Character names for reference chips not found in prompt: ${refInputs.map(r => r.characterName || r.fileName).join(", ")}`);
+      const names = refInputs
+        .map((ref) => ref.characterName || ref.name || ref.fileName)
+        .filter(Boolean)
+        .join(", ");
+
+      throw new Error(`Character reference names not found in prompt: ${names}`);
     }
 
     let cursor = 0;
