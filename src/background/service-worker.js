@@ -8,6 +8,12 @@ import { createQueueExecutor } from "../core/queue/executor.js";
 import { buildContinuityRefPatch } from "../core/queue/continuity-chain.js";
 import { activeVideoTaskBeforeComposerRetry } from "../core/queue/video-retry-policy.js";
 import { buildGalleryItemsFromTasks, buildPartialVideoCompletionPatch, canonicalGalleryItems, deriveTaskOutputLedger, filterGalleryItemsForProject, filterUsableGalleryItems, planMediaDownloads, reconcileTasksWithDownloadResults, reconcileTasksWithGalleryItems, reconcileTasksWithProjectMediaFeed, referenceMediaIdsFromTasks } from "../core/gallery/media-ledger.js";
+import {
+  canStartAnotherTask,
+  nextPendingTaskForOverlap,
+  taskMediaKind,
+  isActiveQueueTask
+} from "../core/queue/scheduler.js";
 import { buildMediaRedirectUrl, buildMediaThumbnailUrl } from "../core/contracts/api.js";
 import { createDebuggerEngine, releaseDebuggerSessions } from "./debugger-engine.js";
 
@@ -23,8 +29,11 @@ const runtimeState = {
   auth: null,
   lastGalleryItems: [],
   lastGalleryProjectId: "",
-  events: []
+  events: [],
+  settings: {},
+  control: {}
 };
+const inFlightTaskPromises = new Map();
 const QUEUE_STORAGE_KEY = "autoflow-10767-rebuild-queue-ledger";
 const RUNTIME_BINDING_STORAGE_KEY = "autoflow-1080-runtime-binding";
 const DOM_DEBUGGER_TRACE_STORAGE_KEY = "autoflow-1081-dom-debugger-trace";
@@ -61,6 +70,84 @@ function recordEvent(event) {
     ...event
   });
   if (runtimeState.events.length > 500) runtimeState.events.shift();
+}
+
+function captureAuthEnvironment(payload = {}) {
+  if (payload.projectId) runtimeState.projectId = String(payload.projectId);
+  if (payload.pageUrl) {
+    runtimeState.pageUrl = String(payload.pageUrl);
+    const id = projectIdFromUrl(payload.pageUrl);
+    if (id) runtimeState.projectId = id;
+  }
+  if (payload.pageTitle) runtimeState.pageTitle = String(payload.pageTitle);
+  if (payload.authEnvironment) runtimeState.authEnvironment = payload.authEnvironment;
+  if (payload.auth) runtimeState.auth = payload.auth;
+  if (payload.settings) runtimeState.settings = payload.settings;
+  if (payload.control) runtimeState.control = payload.control;
+  if (payload.queuePolicy) runtimeState.queuePolicy = payload.queuePolicy;
+
+  if (payload.environment && typeof payload.environment === "object") {
+    runtimeState.authEnvironment = {
+      userAgent: String(payload.environment.userAgent || runtimeState.authEnvironment?.userAgent || ""),
+      screen: {
+        width: Number(payload.environment.screen?.width || runtimeState.authEnvironment?.screen?.width || 0),
+        height: Number(payload.environment.screen?.height || runtimeState.authEnvironment?.screen?.height || 0)
+      }
+    };
+  }
+}
+
+function queueOverlapSettings() {
+  const defaults = {
+    queueConcurrency: 1,
+    overlapMode: "time",
+    overlapStartPercent: 50,
+    estimatedImageGenerateSeconds: 60,
+    estimatedVideoGenerateSeconds: 180,
+    maxDownloadingTasks: 3
+  };
+
+  const fromRuntime = runtimeState?.settings?.queue || {};
+  const fromControl = runtimeState?.control?.presets || {};
+  const fromPolicy = runtimeState?.queuePolicy || {};
+
+  // If policy says overlap is disabled, force concurrency to 1
+  const overlapEnabled = fromPolicy.overlapEnabled ?? (fromControl.queueOverlapEnabled || fromRuntime.queueOverlapEnabled || false);
+
+  return {
+    ...defaults,
+    ...fromControl,
+    ...fromRuntime,
+    ...fromPolicy,
+    queueConcurrency: overlapEnabled 
+      ? Math.max(1, Number(fromPolicy.maxConcurrentTasks || fromRuntime.queueConcurrency || fromControl.queueMaxConcurrentTasks || defaults.queueConcurrency) || 1)
+      : 1,
+    overlapStartPercent: Math.max(10, Math.min(90, Number(fromPolicy.overlapStartPercent || fromRuntime.overlapStartPercent || fromControl.queueOverlapStartPercent || defaults.overlapStartPercent) || 50)),
+    estimatedImageGenerateSeconds: Math.max(10, Number(fromPolicy.estimatedImageGenerateSeconds || fromRuntime.estimatedImageGenerateSeconds || fromControl.estimatedImageGenerateSeconds || defaults.estimatedImageGenerateSeconds) || 60),
+    estimatedVideoGenerateSeconds: Math.max(30, Number(fromPolicy.estimatedVideoGenerateSeconds || fromRuntime.estimatedVideoGenerateSeconds || fromControl.estimatedVideoGenerateSeconds || defaults.estimatedVideoGenerateSeconds) || 180),
+    maxDownloadingTasks: Math.max(1, Number(fromRuntime.maxDownloadingTasks || defaults.maxDownloadingTasks) || 3),
+    overlapMode: String(fromPolicy.overlapMode || fromRuntime.overlapMode || fromControl.queueOverlapMode || defaults.overlapMode)
+  };
+}
+
+function progressFromFlowEvent(event = {}) {
+  const candidates = [
+    event.progressPercent,
+    event.progress,
+    event.percent,
+    event.completionPercent,
+    event.operation?.metadata?.progressPercent,
+    event.operation?.metadata?.progress
+  ];
+
+  for (const value of candidates) {
+    const num = Number(value);
+    if (Number.isFinite(num) && num >= 0) {
+      return Math.max(0, Math.min(100, num <= 1 ? num * 100 : num));
+    }
+  }
+
+  return null;
 }
 
 function recordDebuggerTrace(task = {}, stage = "", detail = {}) {
@@ -522,19 +609,9 @@ function hasOpenImageTasks() {
   });
 }
 
-function taskMediaKind(task = {}) {
-  const mode = String(task.mode || "").trim();
-  if (mode === "text-to-image") return "images";
-  if (["text-to-video", "image-to-video", "start-end-image-to-video", "ingredients-to-video"].includes(mode)) return "videos";
-  return "";
-}
-
-function isTaskActive(task = {}) {
-  return ["submitting", "generating", "downloading"].includes(String(task.status || "").toLowerCase());
-}
 
 function hasActiveTasks() {
-  return ledger.listTasks().some((task) => isTaskActive(task));
+  return ledger.listTasks().some((task) => isActiveQueueTask(task));
 }
 
 function normalizedPromptText(value = "") {
@@ -765,6 +842,7 @@ async function applyFlowGenerationResponseEventToTask(task = {}, event = {}) {
   const terminalRows = statusRows.filter((row) => row.status === "complete" || row.status === "failed");
 
   let patch = {
+    progressPercent: progressFromFlowEvent(event) ?? (task.progressPercent || 0),
     mediaIds,
     statusRows,
     expectedVideos: expected,
@@ -846,7 +924,7 @@ function activeTaskSummary() {
   const tasks = ledger.listTasks();
   return {
     pending: tasks.filter((task) => task.status === TaskStatus.pending).length,
-    active: tasks.filter((task) => isTaskActive(task)).length,
+    active: tasks.filter((task) => isActiveQueueTask(task)).length,
     complete: tasks.filter((task) => task.status === TaskStatus.complete).length,
     failed: tasks.filter((task) => task.status === TaskStatus.failed).length,
     blocked: tasks.filter((task) => task.status === TaskStatus.blocked).length,
@@ -1993,16 +2071,6 @@ async function downloadFileWithReadinessRetries(url, filename, plan = {}, option
   };
 }
 
-function captureAuthEnvironment(payload = {}) {
-  if (!payload.environment || typeof payload.environment !== "object") return;
-  runtimeState.authEnvironment = {
-    userAgent: String(payload.environment.userAgent || ""),
-    screen: {
-      width: Number(payload.environment.screen?.width || 0),
-      height: Number(payload.environment.screen?.height || 0)
-    }
-  };
-}
 
 function chromeCallbackError() {
   return chrome.runtime.lastError ? String(chrome.runtime.lastError.message || chrome.runtime.lastError) : "";
@@ -3612,238 +3680,181 @@ async function resolveContinuityChainForTask(task = {}, tabId = null) {
   await persistQueueState();
   return { ok: false, blocked: true, task: blocked, status: result.status, error };
 }
-
-async function runQueueUntilIdle(preferredTabId) {
-  await queueReady;
+async function runQueueUntilIdle(tabId) {
   if (runtimeState.queueRunning) return;
-  const runToken = Number(runtimeState.queueRunToken || 0) + 1;
-  runtimeState.queueRunToken = runToken;
   runtimeState.queueRunning = true;
+  const runToken = Date.now();
+  runtimeState.queueRunToken = runToken;
+
   const isActiveRun = () => runtimeState.queueRunning && runtimeState.queueRunToken === runToken;
-  recordEvent({ type: "queue.start", runToken });
+
   try {
-    const tab = await findFlowTab(preferredTabId);
-    if (!tab?.id) throw new Error("flow_tab_not_found");
-    const executor = createExecutorForTab(tab.id);
+    const tab = await (tabId ? chrome.tabs.get(tabId).catch(() => null) : findFlowTab());
+    if (!tab?.id) {
+      recordEvent({ type: "queue.error", error: "flow_tab_not_found" });
+      return;
+    }
 
     while (isActiveRun()) {
-      const next = scheduler.nextPendingTask();
-      if (!next) {
-        const mergedCompletedRepairs = await mergeCompletedVideoRepairTasks("queue_idle_completed_repairs");
-        if (mergedCompletedRepairs > 0) {
-          await persistQueueState();
+      await maybeStartMoreQueueTasks(tab.id, runToken);
+
+      const tasks = ledger.listTasks();
+      const hasPending = tasks.some((t) => t.status === TaskStatus.pending);
+      const hasInFlight = inFlightTaskPromises.size > 0;
+
+      if (!hasPending && !hasInFlight) {
+        // Check for tasks that need settling
+        const taskToSettle = tasks.find((t) => t.status === TaskStatus.generating && !inFlightTaskPromises.has(t.id));
+        if (taskToSettle) {
+          await startTaskInBackground(taskToSettle, tab.id, runToken);
           continue;
         }
-        const activeVideoTask = ledger.listTasks().find((task) => task.status === TaskStatus.generating && taskMediaKind(task) === "videos");
-        if (activeVideoTask) {
-          const settledVideo = await waitForVideoTaskOutputs(activeVideoTask, tab.id);
-          if (!isActiveRun()) break;
-          recordEvent({
-            type: "queue.video_settle.done",
-            taskId: settledVideo?.id || activeVideoTask.id,
-            status: settledVideo?.status || activeVideoTask.status,
-            foundVideos: settledVideo?.foundVideos || 0,
-            expectedVideos: settledVideo?.expectedVideos || activeVideoTask.expectedVideos || activeVideoTask.repeatCount || 1
-          });
-          if (settledVideo?.retryOfTaskId) {
-            const mergedParent = await mergeVideoRepairTaskIntoParent(settledVideo);
-            if (mergedParent?.partialFailure === true) {
-              await appendVideoRepairTask(mergedParent, "video_repair_still_partial");
-            }
-          } else {
-            await appendVideoRepairTask(settledVideo, "video_settle_partial");
-          }
-          await persistQueueState();
-          if (settledVideo?.status === TaskStatus.generating) {
-            await sleep(3000);
-            continue;
-          }
-          continue;
-        }
-        const activeImageTask = ledger.listTasks().find((task) => task.status === TaskStatus.generating && taskMediaKind(task) === "images");
-        if (!activeImageTask) break;
-        const settled = await waitForImageTaskOutputs(activeImageTask, tab.id);
-        if (!isActiveRun()) break;
-        recordEvent({
-          type: "queue.image_settle.done",
-          taskId: settled?.id || activeImageTask.id,
-          status: settled?.status || activeImageTask.status,
-          foundImages: settled?.foundImages || 0,
-          expectedImages: settled?.expectedImages || activeImageTask.expectedImages || activeImageTask.repeatCount || 1
-        });
-        await persistQueueState();
-        if (settled?.status === TaskStatus.generating) {
-          await sleep(3000);
-          continue;
-        }
-        continue;
+        break;
       }
-      try {
-        const activeBeforeComposerRetry = activeVideoTaskBeforeComposerRetry(next, ledger.listTasks());
-        if (activeBeforeComposerRetry) {
-          const settledVideo = await waitForVideoTaskOutputs(activeBeforeComposerRetry, tab.id);
-          if (!isActiveRun()) break;
-          const latestNext = ledger.getTask(next.id) || next;
-          const composerRetryWaitCount = Math.max(0, Number(latestNext.composerRetryWaitCount || 0) || 0) + 1;
-          ledger.updateTask(next.id, {
-            composerRetryWaitCount,
-            composerRetryWaitedAt: new Date().toISOString()
-          });
-          recordEvent({
-            type: "queue.video_wait_before_composer_retry",
-            taskId: next.id,
-            activeTaskId: settledVideo?.id || activeBeforeComposerRetry.id,
-            status: settledVideo?.status || activeBeforeComposerRetry.status,
-            foundVideos: settledVideo?.foundVideos || 0,
-            expectedVideos: settledVideo?.expectedVideos || activeBeforeComposerRetry.expectedVideos || activeBeforeComposerRetry.repeatCount || 1,
-            lastError: next.lastError || "",
-            composerRetryWaitCount
-          });
-          if (settledVideo?.retryOfTaskId) {
-            const mergedParent = await mergeVideoRepairTaskIntoParent(settledVideo);
-            if (mergedParent?.partialFailure === true) {
-              await appendVideoRepairTask(mergedParent, "composer_retry_wait_repair_still_partial");
-            }
-          } else {
-            await appendVideoRepairTask(settledVideo, "composer_retry_wait_video_settle_partial");
-          }
-          await persistQueueState();
-          if (settledVideo?.status === TaskStatus.generating) {
-            await sleep(3000);
-          }
-          continue;
-        }
-        const continuity = await resolveContinuityChainForTask(next, tab.id);
-        if (continuity.waiting) continue;
-        if (continuity.blocked) continue;
-        const nextTask = continuity.task || ledger.getTask(next.id) || next;
-        await ensureTaskProjectId(nextTask, tab.id);
-        await persistQueueState();
-        if (!isActiveRun()) break;
-        const taskToRun = ledger.getTask(nextTask.id) || nextTask;
-        const submitOnlyVideos = taskMediaKind(taskToRun) === "videos";
-        let task = await executor.runTask(taskToRun.id, { submitOnlyVideos });
-        if (!isActiveRun()) break;
-        if (!submitOnlyVideos && taskMediaKind(task) === "images" && task?.status !== TaskStatus.generating && task?.status !== TaskStatus.complete) {
-          task = await recoverImageTaskAfterSubmitFailure(task, tab.id, "after_submit_result");
-        }
-        if (!isActiveRun()) break;
-        task = submitOnlyVideos ? task : await waitForImageTaskOutputs(task, tab.id);
-        if (!isActiveRun()) break;
-        recordEvent({
-          type: "queue.task.done",
-          taskId: task?.id || next.id,
-          status: task?.status || "unknown",
-          failureClass: task?.failureClass || "",
-          failureScope: task?.failureScope || "",
-          mediaIds: task?.mediaIds || []
-        });
-        if (task?.status === TaskStatus.complete) {
-          if (task.retryOfTaskId) {
-            task = await mergeVideoRepairTaskIntoParent(task) || task;
-            if (task?.partialFailure === true) {
-              await appendVideoRepairTask(task, "video_repair_still_partial");
-            }
-          } else {
-            await appendVideoRepairTask(task, "queue_task_complete_partial");
-          }
-          await autoDownloadCompletedTasks([task.id], "queue_complete");
-        }
-        await persistQueueState();
-        const pendingAfterSubmit = scheduler.nextPendingTask();
-        if (submitOnlyVideos && task?.status === TaskStatus.generating && pendingAfterSubmit) {
-          const waitMs = generationSubmitWaitMs(task);
-          recordEvent({
-            type: "queue.video_inter_submit_wait",
-            taskId: task.id,
-            waitMs,
-            minInitialWaitTime: Number(task.minInitialWaitTime || 0),
-            maxInitialWaitTime: Number(task.maxInitialWaitTime || 0)
-          });
-          if (waitMs > 0) await sleep(waitMs);
-        } else if (submitOnlyVideos && task?.status === TaskStatus.generating) {
-          recordEvent({
-            type: "queue.video_submit_phase_complete",
-            taskId: task.id,
-            reason: "keep_debugger_until_queue_finish"
-          });
-        }
-        if (isRecoverableGlobalTask(task)) {
-          const recovery = await recoverGlobalQueueFailure(task, tab.id);
-          if (!recovery.ok) break;
-          continue;
-        }
-        if (["failed", "blocked"].includes(task?.status) && task?.failureScope === "global") {
-          recordEvent({
-            type: "queue.global_block",
-            taskId: task.id,
-            failureClass: task.failureClass || "",
-            healAction: task.healAction || "",
-            lastError: task.lastError || ""
-          });
-          break;
-        }
-        if (task?.status === "pending") {
-          await sleep(Math.min(30000, Math.max(3000, Number(task.attempts || 1) * 3000)));
-        }
-      } catch (error) {
-        if (!isActiveRun() || !ledger.getTask(next.id)) {
-          recordEvent({
-            type: "queue.stale_task_ignored",
-            taskId: next.id,
-            runToken,
-            activeRunToken: runtimeState.queueRunToken,
-            error: String(error?.message || error || "stale_queue_task_failed")
-          });
-          break;
-        }
-        const task = scheduler.markBlocked(next.id, error);
-        await persistQueueState();
-        recordEvent({
-          type: "queue.task.error",
-          taskId: next.id,
-          error: String(error?.message || error || "queue_task_failed"),
-          failureClass: task?.failureClass || "",
-          failureScope: task?.failureScope || "",
-          healAction: task?.healAction || ""
-        });
-        if (isRecoverableGlobalTask(task)) {
-          const recovery = await recoverGlobalQueueFailure(task, tab.id);
-          if (recovery.ok) continue;
-        }
-        if (task?.failureScope === "global") break;
-      }
+
+      await sleep(1000);
+      if (!isActiveRun()) break;
     }
   } catch (error) {
     if (runtimeState.queueRunToken === runToken) {
-      recordEvent({
-        type: "queue.error",
-        runToken,
-        error: String(error?.message || error || "queue_failed")
-      });
-    } else {
-      recordEvent({
-        type: "queue.stale_run_error_ignored",
-        runToken,
-        activeRunToken: runtimeState.queueRunToken,
-        error: String(error?.message || error || "queue_failed")
-      });
+      recordEvent({ type: "queue.error", error: String(error?.message || error || "queue_failed") });
     }
   } finally {
-    await releaseDebuggerSessions("queue_finished", recordDebuggerTrace);
     if (runtimeState.queueRunToken === runToken) {
       runtimeState.queueRunning = false;
       await persistQueueState();
-      recordEvent({ type: "queue.stop", runToken });
-    } else {
-      recordEvent({
-        type: "queue.stale_run_exit",
-        runToken,
-        activeRunToken: runtimeState.queueRunToken
-      });
+      await releaseDebuggerSessions("queue_finished", recordDebuggerTrace);
     }
   }
 }
+
+async function maybeStartMoreQueueTasks(tabId, runToken) {
+  const settings = queueOverlapSettings();
+  while (true) {
+    const tasks = ledger.listTasks();
+    const nextTask = nextPendingTaskForOverlap(tasks, settings, Date.now());
+    if (!nextTask) break;
+    await startTaskInBackground(nextTask, tabId, runToken);
+  }
+}
+
+async function startTaskInBackground(task, tabId, runToken) {
+  const id = String(task?.id || "");
+  if (!id || inFlightTaskPromises.has(id)) return;
+
+  const isActiveRun = () => runtimeState.queueRunning && runtimeState.queueRunToken === runToken;
+
+  const promise = (async () => {
+    try {
+      await executeSingleQueueTask(id, tabId, isActiveRun);
+    } catch (error) {
+      console.error(`Task ${id} failed in background:`, error);
+    } finally {
+      inFlightTaskPromises.delete(id);
+      await persistQueueState();
+    }
+  })();
+
+  inFlightTaskPromises.set(id, promise);
+}
+
+async function executeSingleQueueTask(taskId, tabId, isActiveRun) {
+  const next = ledger.getTask(taskId);
+  if (!next) return;
+
+  if (next.status === TaskStatus.generating) {
+    if (taskMediaKind(next) === "videos") {
+      const settledVideo = await waitForVideoTaskOutputs(next, tabId);
+      if (!isActiveRun()) return;
+      if (settledVideo?.retryOfTaskId) {
+        await mergeVideoRepairTaskIntoParent(settledVideo);
+      } else {
+        await appendVideoRepairTask(settledVideo, "video_settle_partial");
+      }
+    } else {
+      const settled = await waitForImageTaskOutputs(next, tabId);
+      if (!isActiveRun()) return;
+      await appendVideoRepairTask(settled, "image_settle_partial");
+    }
+    return;
+  }
+
+  try {
+    const activeBeforeComposerRetry = activeVideoTaskBeforeComposerRetry(next, ledger.listTasks());
+    if (activeBeforeComposerRetry) {
+      await waitForVideoTaskOutputs(activeBeforeComposerRetry, tabId);
+      if (!isActiveRun()) return;
+      ledger.updateTask(taskId, {
+        composerRetryWaitCount: (Number(next.composerRetryWaitCount || 0) || 0) + 1,
+        composerRetryWaitedAt: new Date().toISOString()
+      });
+    }
+
+    const continuity = await resolveContinuityChainForTask(next, tabId);
+    if (continuity.waiting || continuity.blocked) return;
+
+    const nextTask = continuity.task || ledger.getTask(taskId) || next;
+    await ensureTaskProjectId(nextTask, tabId);
+    await persistQueueState();
+
+    if (!isActiveRun()) return;
+
+    const executor = createExecutorForTab(tabId);
+    const taskToRun = ledger.getTask(nextTask.id) || nextTask;
+    const submitOnlyVideos = taskMediaKind(taskToRun) === "videos";
+
+    let task = await executor.runTask(taskToRun.id, { submitOnlyVideos });
+    if (!isActiveRun()) return;
+
+    if (!submitOnlyVideos && taskMediaKind(task) === "images" && task?.status !== TaskStatus.generating && task?.status !== TaskStatus.complete) {
+      task = await recoverImageTaskAfterSubmitFailure(task, tabId, "after_submit_result");
+    }
+
+    if (!isActiveRun()) return;
+    task = submitOnlyVideos ? task : await waitForImageTaskOutputs(task, tabId);
+    if (!isActiveRun()) return;
+
+    recordEvent({
+      type: "queue.task.done",
+      taskId: task?.id || taskId,
+      status: task?.status || "unknown",
+      failureClass: task?.failureClass || "",
+      failureScope: task?.failureScope || "",
+      mediaIds: task?.mediaIds || []
+    });
+
+    if (task?.status === TaskStatus.complete) {
+      if (task.retryOfTaskId) {
+        task = await mergeVideoRepairTaskIntoParent(task) || task;
+      } else {
+        await appendVideoRepairTask(task, "queue_task_complete_partial");
+      }
+      await autoDownloadCompletedTasks([task.id], "queue_complete");
+    }
+
+    await persistQueueState();
+
+    if (submitOnlyVideos && task?.status === TaskStatus.generating) {
+      const waitMs = generationSubmitWaitMs(task);
+      if (waitMs > 0) await sleep(waitMs);
+    }
+
+    if (isRecoverableGlobalTask(task)) {
+      await recoverGlobalQueueFailure(task, tabId);
+    }
+
+    if (["failed", "blocked"].includes(task?.status) && task?.failureScope === "global") {
+      runtimeState.queueRunning = false;
+    }
+
+  } catch (error) {
+    if (isActiveRun() && ledger.getTask(taskId)) {
+      scheduler.markBlocked(taskId, error);
+      await persistQueueState();
+    }
+  }
+}
+
 
 function generationSubmitWaitMs(task = {}) {
   const min = Math.max(0, Number(task.minInitialWaitTime || task.generationWaitMin || 0) || 0);

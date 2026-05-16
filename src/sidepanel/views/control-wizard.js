@@ -1075,6 +1075,7 @@ function buildStep3Body(state, prompts, refs, mode) {
       el("span", { class: "afw-right", text: tr(state, "settingsOverrideHere") }),
     ),
     settingsCard,
+    buildStep3OverlapCard(state, dispatch),
     estimate,
   );
 }
@@ -1118,4 +1119,113 @@ function buildStepNav(state, currentStep, mode, promptCount, presets, dispatch) 
   return el("div", { class: "afw-step-nav" },
     el("div", { class: "afw-step-summary", text: summary }),
   );
+}
+function buildStep3OverlapCard(state, dispatch) {
+  const p = overlapPresets(state);
+  const isVideo = String(state.control?.mode || "").endsWith("video");
+
+  return el("section", { class: "afw-gen-card afw-overlap-card", attrs: { style: "margin-top:10px;" } },
+    el("div", { class: "afw-eyebrow", attrs: { style: "margin-bottom:8px;" } }, icon("queue_play_next"), "Generation Queue"),
+
+    el("label", { class: "afw-toggle-row", attrs: { style: "display:flex; align-items:center; gap:8px; margin-bottom:12px; cursor:pointer;" } },
+      el("input", {
+        attrs: { type: "checkbox", ...(p.enabled ? { checked: true } : {}) },
+        on: {
+          change: (e) => {
+            const enabled = e.currentTarget.checked;
+            dispatch(presetPatch(state, "queueOverlapEnabled", enabled));
+            if (!enabled) {
+              dispatch(presetPatch(state, "queueMaxConcurrentTasks", 1));
+            }
+          }
+        }
+      }),
+      el("span", { attrs: { style: "font-size:12px; font-weight:500;" }, text: "Enable overlap generation" })
+    ),
+
+    el("div", { attrs: { style: "display:grid; grid-template-columns: 1fr 1fr; gap:10px;" } },
+      el("label", { class: "afw-field", attrs: { style: "display:flex; flex-direction:column; gap:4px;" } },
+        el("span", { attrs: { style: "font-size:10px; color:var(--afw-text-soft);" }, text: "Max concurrent tasks" }),
+        el("select", {
+          class: "afw-val-btn",
+          attrs: { style: "width:100%;" },
+          on: { change: (e) => dispatch(presetPatch(state, "queueMaxConcurrentTasks", Number(e.currentTarget.value || 1))) }
+        },
+          option("1", "1 — Safe", String(p.maxConcurrent) === "1"),
+          option("2", "2 — Recommended", String(p.maxConcurrent) === "2"),
+          option("3", "3 — Aggressive", String(p.maxConcurrent) === "3")
+        )
+      ),
+
+      el("label", { class: "afw-field", attrs: { style: "display:flex; flex-direction:column; gap:4px;" } },
+        el("span", { attrs: { style: "font-size:10px; color:var(--afw-text-soft);" }, text: "Overlap trigger" }),
+        el("select", {
+          class: "afw-val-btn",
+          attrs: { style: "width:100%;" },
+          on: { change: (e) => dispatch(presetPatch(state, "queueOverlapMode", e.currentTarget.value)) }
+        },
+          option("time", "Time estimate", p.mode === "time"),
+          option("progress", "API progress", p.mode === "progress")
+        )
+      ),
+
+      el("label", { class: "afw-field", attrs: { style: "display:flex; flex-direction:column; gap:4px;" } },
+        el("span", { attrs: { style: "font-size:10px; color:var(--afw-text-soft);" }, text: "Start next task at (%)" }),
+        el("input", {
+          class: "afw-val-btn",
+          value: String(p.startPercent),
+          attrs: { type: "number", min: "10", max: "90", step: "5", style: "width:100%; text-align:left;" },
+          on: { change: (e) => dispatch(presetPatch(state, "queueOverlapStartPercent", Number(e.currentTarget.value || 50))) }
+        })
+      ),
+
+      el("label", { class: "afw-field", attrs: { style: "display:flex; flex-direction:column; gap:4px;" } },
+        el("span", { attrs: { style: "font-size:10px; color:var(--afw-text-soft);" }, text: isVideo ? "Video estimate (sec)" : "Image estimate (sec)" }),
+        el("input", {
+          class: "afw-val-btn",
+          value: String(isVideo ? p.videoSeconds : p.imageSeconds),
+          attrs: { type: "number", min: "10", max: "1800", step: "5", style: "width:100%; text-align:left;" },
+          on: { change: (e) => dispatch(presetPatch(state, isVideo ? "estimatedVideoGenerateSeconds" : "estimatedImageGenerateSeconds", Number(e.currentTarget.value || 60))) }
+        })
+      )
+    ),
+
+    el("p", {
+      attrs: { style: "font-size:10px; color:var(--afw-text-soft); margin-top:8px; line-height:1.4;" },
+      text: p.enabled
+        ? `When a task reaches ${p.startPercent}% by ${p.mode === "time" ? "estimated time" : "API progress"}, AutoFlow starts the next task.`
+        : "Overlap is off. Queue will run tasks one by one."
+    })
+  );
+}
+
+function overlapPresets(state) {
+  const presets = state.control?.presets || {};
+  return {
+    enabled: presets.queueOverlapEnabled === true,
+    maxConcurrent: clampInt(presets.queueMaxConcurrentTasks, 1, 3, 1),
+    mode: ["time", "progress"].includes(String(presets.queueOverlapMode)) ? String(presets.queueOverlapMode) : "time",
+    startPercent: clampInt(presets.queueOverlapStartPercent, 10, 90, 50),
+    imageSeconds: clampInt(presets.estimatedImageGenerateSeconds, 10, 600, 60),
+    videoSeconds: clampInt(presets.estimatedVideoGenerateSeconds, 30, 1800, 180)
+  };
+}
+
+function presetPatch(state, key, value) {
+  return {
+    control: {
+      presets: {
+        ...(state.control?.presets || {}),
+        [key]: value
+      }
+    }
+  };
+}
+
+function option(value, label, selected = false) {
+  return el("option", {
+    value,
+    text: label,
+    attrs: selected ? { selected: true } : {}
+  });
 }

@@ -4210,6 +4210,20 @@ async function requestEnqueueAndRun() {
   }
 }
 
+function buildQueueOverlapPolicyFromState(nextState = state) {
+  const p = nextState.control?.presets || {};
+  const enabled = p.queueOverlapEnabled === true;
+
+  return {
+    overlapEnabled: enabled,
+    maxConcurrentTasks: enabled ? Math.max(1, Math.min(3, Number(p.queueMaxConcurrentTasks || 1))) : 1,
+    overlapMode: ["time", "progress"].includes(String(p.queueOverlapMode)) ? String(p.queueOverlapMode) : "time",
+    overlapStartPercent: Math.max(10, Math.min(90, Number(p.queueOverlapStartPercent || 50))),
+    estimatedImageGenerateSeconds: Math.max(10, Math.min(600, Number(p.estimatedImageGenerateSeconds || 60))),
+    estimatedVideoGenerateSeconds: Math.max(30, Math.min(1800, Number(p.estimatedVideoGenerateSeconds || 180)))
+  };
+}
+
 async function enqueueJobs(prebuiltJobs = null, options = {}) {
   const jobs = Array.isArray(prebuiltJobs) ? prebuiltJobs : await buildJobs();
   const effectiveMode = String(options?.modeOverride || state.control.mode || FLOW_MODES.textToImage);
@@ -4247,6 +4261,7 @@ async function enqueueJobs(prebuiltJobs = null, options = {}) {
     projectId: leadJob.projectId || state.runtime.projectId,
     submitPath: leadJob.submitPath || state.control.presets.submitPath,
     videoLength: leadJob.videoLength || state.control.presets.videoLength,
+    queuePolicy: buildQueueOverlapPolicyFromState(state),
     ...settings
   });
   applyRuntimePayload(response?.payload || {});
@@ -4314,7 +4329,11 @@ async function runQueue() {
   state.ui.activeRoute = "live";
   await persistState();
   render();
-  const response = await send(MessageType.QueueStart, { environment: authEnvironment() });
+  const response = await send(MessageType.QueueStart, { 
+    environment: authEnvironment(),
+    settings: state.settings,
+    control: state.control
+  });
   applyRuntimePayload(response?.payload || {});
   scheduleRuntimeRefresh(0);
   scheduleLiveQueueRefreshBurst();
@@ -4328,7 +4347,11 @@ async function runQueue() {
 }
 
 async function resumeQueue() {
-  const response = await send(MessageType.QueueResume, { environment: authEnvironment() });
+  const response = await send(MessageType.QueueResume, { 
+    environment: authEnvironment(),
+    settings: state.settings,
+    control: state.control
+  });
   applyRuntimePayload(response?.payload || {});
   const resumed = Number(response?.payload?.resumed || 0);
   const pending = Number(response?.payload?.pending || 0);

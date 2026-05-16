@@ -5564,3 +5564,35 @@ button:active:not(:disabled) {
   word-break: break-word;
   white-space: normal;
 }
+/* Queue Overlap Card (Step 3) */
+.afw-overlap-card {
+  border: 1px solid rgba(138, 181, 255, 0.25) !important;
+  background: linear-gradient(150deg, rgba(28, 38, 77, 0.95), rgba(16, 24, 53, 0.95)) !important;
+}
+
+.afw-overlap-card .afw-eyebrow {
+  color: var(--af-accent) !important;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.afw-overlap-card .afw-toggle-row {
+  background: rgba(109, 167, 255, 0.08);
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(109, 167, 255, 0.15);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  cursor: pointer;
+}
+
+.afw-overlap-card .afw-toggle-row:hover {
+  background: rgba(109, 167, 255, 0.12);
+}
+
+.afw-overlap-card .afw-field span {
+  font-weight: 600;
+}

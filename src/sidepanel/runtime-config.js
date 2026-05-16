@@ -24,6 +24,15 @@ export const FLOW_MODES = Object.freeze({
   ingredientsToVideo: "ingredients-to-video"
 });
 
+export const DEFAULT_QUEUE_SETTINGS = Object.freeze({
+  queueConcurrency: 2,
+  overlapMode: "time", // "off" | "progress" | "time"
+  overlapStartPercent: 50,
+  estimatedImageGenerateSeconds: 60,
+  estimatedVideoGenerateSeconds: 180,
+  maxDownloadingTasks: 3
+});
+
 export function createDefaultState(now = new Date().toISOString()) {
   return {
     version: 4,
@@ -124,7 +133,13 @@ export function createDefaultState(now = new Date().toISOString()) {
         mapLineRefs: true,
         autoStartNextJob: true,
         autoRetryFailedUntilZero: false,
-        autopilotT2IToF2V: "off"
+        autopilotT2IToF2V: "off",
+        queueOverlapEnabled: false,
+        queueMaxConcurrentTasks: 1,
+        queueOverlapMode: "time",
+        queueOverlapStartPercent: 50,
+        estimatedImageGenerateSeconds: 60,
+        estimatedVideoGenerateSeconds: 180
       }
     },
     queue: {
@@ -158,7 +173,8 @@ export function createDefaultState(now = new Date().toISOString()) {
     settings: {
       persistLogs: true,
       requireFlowTab: true,
-      debugCapture: false
+      debugCapture: false,
+      queue: { ...DEFAULT_QUEUE_SETTINGS }
     },
     account: {
       status: "unknown",
@@ -260,7 +276,20 @@ export function mergeState(base, incoming) {
     : [];
   output.history = normalizeHistory(output.history);
   output.account = normalizeAccount(output.account);
+  output.settings = normalizeSettings(output.settings);
   return output;
+}
+
+function normalizeSettings(settings = {}) {
+  const base = createDefaultState().settings;
+  return {
+    ...base,
+    ...settings,
+    queue: {
+      ...base.queue,
+      ...(settings?.queue || {})
+    }
+  };
 }
 
 function normalizePresets(presets = {}, sourceVersion = 0) {
@@ -322,6 +351,12 @@ function normalizePresets(presets = {}, sourceVersion = 0) {
   out.mapLineRefs = Boolean(out.mapLineRefs);
   out.autoStartNextJob = Boolean(out.autoStartNextJob);
   out.autoRetryFailedUntilZero = Boolean(out.autoRetryFailedUntilZero);
+  out.queueOverlapEnabled = Boolean(out.queueOverlapEnabled);
+  out.queueMaxConcurrentTasks = clampInt(out.queueMaxConcurrentTasks, 1, 3, 1);
+  out.queueOverlapMode = ["time", "progress"].includes(String(out.queueOverlapMode)) ? String(out.queueOverlapMode) : "time";
+  out.queueOverlapStartPercent = clampInt(out.queueOverlapStartPercent, 10, 90, 50);
+  out.estimatedImageGenerateSeconds = clampInt(out.estimatedImageGenerateSeconds, 10, 600, 60);
+  out.estimatedVideoGenerateSeconds = clampInt(out.estimatedVideoGenerateSeconds, 30, 1800, 180);
   return out;
 }
 
