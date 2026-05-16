@@ -162,6 +162,9 @@ export function createOverlapController({
     pickNextTasksToStart,
     shouldUnlockNextTask,
     markUnlockedNext,
-    maybeUnlockFromTask
+    maybeUnlockFromTask,
+    markTaskProgress(taskId, _percent, _source) {
+      // Stub: purely time-based gating is now handled via shouldUnlockNextTask
+    }
   };
 }

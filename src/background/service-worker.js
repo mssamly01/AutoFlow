@@ -1120,17 +1120,6 @@ async function executeDownloadPlans(plans = [], source = "manual") {
       ? await downloadFileWithReadinessRetries(resolvedPlan.url, resolvedPlan.filename, { ...plan, fallbackDownloadUrl: resolvedPlan.meta?.fallbackDownloadUrl || "" }, { kind: plan.kind, resolution: resolvedPlan.meta?.outputResolution || plan.resolution || "" })
       : { ok: false, error: resolvedPlan.error || "download_resolution_resolve_failed", downloadId: null };
 
-    // Update progress heartbeat during downloading for overlap gating.
-    if (plan.taskId) {
-      const task = ledger.getTask(plan.taskId);
-      if (task) {
-        const outputLedger = deriveTaskOutputLedger(task);
-        const expectedDownloads = outputLedger.expectedDownloadCount || 1;
-        const saved = outputLedger.savedCount + (result.ok ? 1 : 0);
-        const progress = Math.min(99, Math.round((saved / expectedDownloads) * 100));
-        overlapController.markTaskProgress(task.id, progress, "download_heartbeat");
-      }
-    }
     if (!result.ok) {
       releaseDownloadReservation(reservation);
     }
@@ -1333,9 +1322,10 @@ async function autoDownloadCompletedTasks(taskIds = [], reason = "completion") {
     };
     const selectedIds = mediaIds.map((mediaId) => `${task.id}:${mediaId}`);
 
-    // Build a gallery state specifically for this task to avoid project-id filtering issues
-    // but include ledger items so we can find the media URLs.
-    const gallery = galleryState([], "queue-ledger", "");
+    // Dùng projectId của task để gallery không bị lọc sạch bởi filterGalleryItemsForProject.
+    // Nếu task không có projectId, fallback về runtimeState.projectId.
+    const taskProjectId = String(task.projectId || runtimeState.projectId || "").trim();
+    const gallery = galleryState([], "queue-ledger", taskProjectId);
     const plans = planMediaDownloads(gallery.items, {
       selectedIds,
       folder,
@@ -1344,6 +1334,37 @@ async function autoDownloadCompletedTasks(taskIds = [], reason = "completion") {
       reservedArtifactKeys: [...downloadReservations.artifacts.keys()],
       reservedTargetPaths: [...downloadReservations.targets.keys()]
     });
+
+    // Fallback: nếu gallery không có item (do sync chậm), build plan thẳng từ task outputs
+    if (plans.length === 0) {
+      const outputs = Array.isArray(task.outputs) ? task.outputs : [];
+      const pendingIds = new Set(mediaIds);
+      const kind = taskMediaKind(task);
+      for (const output of outputs) {
+        if (!output?.mediaId || !pendingIds.has(output.mediaId)) continue;
+        const mediaUrl = output.mediaUrl || buildMediaRedirectUrl({ mediaId: output.mediaId });
+        if (!mediaUrl) continue;
+        const artifactKey = `${kind}:${output.mediaId}:original`;
+        if (downloadReservations.artifacts.has(artifactKey)) continue;
+        
+        plans.push({
+          itemId: `${task.id}:${output.mediaId}`,
+          taskId: task.id,
+          mediaId: output.mediaId,
+          kind,
+          url: mediaUrl,
+          filename: `${folder}/${task.id.slice(0, 8)}-${output.mediaId.slice(0, 8)}.${kind === "images" ? "jpg" : "mp4"}`,
+          artifactKey,
+          targetPathKey: artifactKey,
+          source: "task-output-fallback",
+          matchMethod: "direct",
+          downloadPath: "direct_named",
+          resolution: "",
+          requiresUpscale: false,
+          dedupeDecision: "allowed"
+        });
+      }
+    }
 
     if (plans.length > 0) {
       recordEvent({ type: "media.auto_download.start_task", taskId: task.id, reason, planned: plans.length });
@@ -1629,14 +1650,8 @@ async function waitForImageTaskOutputs(task = {}, preferredTabId) {
     });
     await sleep(scanIndex === 0 ? Math.min(3500, settleMs) : settleMs);
 
-    // Progress heartbeat for overlap gating.
-    const currentFound = Number(current.foundImages || 0);
-    const timerProgress = Math.min(99, Math.round(((scanIndex + 1) / maxScans) * 100));
-    const progress = currentFound > 0
-      ? Math.min(99, Math.round((currentFound / expected) * 100))
-      : timerProgress;
-
-    overlapController.markTaskProgress(current.id, progress, "image_wait_heartbeat");
+    // Dùng timer thuần – không dùng %. Chỉ cần pump để overlap controller
+    // kiểm tra thời gian và unlock task tiếp theo khi đủ delaySeconds.
     pumpOverlapQueue(preferredTabId);
 
     const scanResult = await scanFlowGallery(preferredTabId);
