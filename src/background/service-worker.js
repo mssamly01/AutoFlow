@@ -1119,6 +1119,18 @@ async function executeDownloadPlans(plans = [], source = "manual") {
     const result = resolvedPlan.ok
       ? await downloadFileWithReadinessRetries(resolvedPlan.url, resolvedPlan.filename, { ...plan, fallbackDownloadUrl: resolvedPlan.meta?.fallbackDownloadUrl || "" }, { kind: plan.kind, resolution: resolvedPlan.meta?.outputResolution || plan.resolution || "" })
       : { ok: false, error: resolvedPlan.error || "download_resolution_resolve_failed", downloadId: null };
+
+    // Update progress heartbeat during downloading for overlap gating.
+    if (plan.taskId) {
+      const task = ledger.getTask(plan.taskId);
+      if (task) {
+        const outputLedger = deriveTaskOutputLedger(task);
+        const expectedDownloads = outputLedger.expectedDownloadCount || 1;
+        const saved = outputLedger.savedCount + (result.ok ? 1 : 0);
+        const progress = Math.min(99, Math.round((saved / expectedDownloads) * 100));
+        overlapController.markTaskProgress(task.id, progress, "download_heartbeat");
+      }
+    }
     if (!result.ok) {
       releaseDownloadReservation(reservation);
     }
@@ -1644,6 +1656,17 @@ async function waitForImageTaskOutputs(task = {}, preferredTabId) {
       expectedImages: expected
     });
     await sleep(scanIndex === 0 ? Math.min(3500, settleMs) : settleMs);
+
+    // Progress heartbeat for overlap gating.
+    const currentFound = Number(current.foundImages || 0);
+    const timerProgress = Math.min(99, Math.round(((scanIndex + 1) / maxScans) * 100));
+    const progress = currentFound > 0
+      ? Math.min(99, Math.round((currentFound / expected) * 100))
+      : timerProgress;
+
+    overlapController.markTaskProgress(current.id, progress, "image_wait_heartbeat");
+    pumpOverlapQueue(preferredTabId);
+
     const scanResult = await scanFlowGallery(preferredTabId);
     current = ledger.getTask(task.id) || current;
     recordEvent({
@@ -3680,6 +3703,13 @@ function pumpOverlapQueue(tabId) {
   if (!config.enabled) return;
 
   startOverlapTimer(tabId);
+
+  // Proactively check if any active task should unlock the next one
+  // based on latest progress updates (heartbeats).
+  const activeTasks = overlapController.getActiveTasks();
+  for (const task of activeTasks) {
+    overlapController.maybeUnlockFromTask(task.id);
+  }
 
   const tasks = overlapController.pickNextTasksToStart();
   if (!tasks.length) return;

@@ -186,7 +186,7 @@ export function filterUsableGalleryItems(items = [], options = {}) {
 }
 
 function itemTaskNumber(item = {}, fallback = 1) {
-  const explicit = Number.parseInt(item.taskNumber || item.jobIndex + 1, 10);
+  const explicit = Number.parseInt(item.taskNumber ?? (item.jobIndex !== undefined ? item.jobIndex + 1 : undefined), 10);
   return Number.isFinite(explicit) && explicit > 0 ? explicit : fallback;
 }
 
@@ -341,7 +341,7 @@ export function buildGalleryItemsFromTasks(tasks = []) {
         jobId: String(task.jobId || ""),
         projectId: String(task.projectId || ""),
         jobIndex: Number.isFinite(Number(task.jobIndex)) ? Number(task.jobIndex) : 0,
-        taskNumber: Number.isFinite(Number(task.jobIndex)) ? Number(task.jobIndex) + 1 : 1,
+        taskNumber: Number.isFinite(Number(task.jobIndex)) ? Number(task.jobIndex) + 1 : (tasks.indexOf(task) + 1),
         mediaId,
         kind,
         prompt: displayPrompt,
@@ -1342,8 +1342,9 @@ function downloadSlotGroupKey(item = {}, taskNumber = 1) {
 }
 
 function plannedTaskNumber(item = {}, fallback = 1) {
-  if (item.taskNumber !== undefined || item.jobIndex !== undefined) return itemTaskNumber(item, fallback);
-  return itemTaskNumber(item, fallback);
+  const explicit = itemTaskNumber(item, null);
+  if (explicit !== null) return explicit;
+  return fallback;
 }
 
 function reserveDownloadSlot(slotGroups, item = {}, taskNumber = 1) {
