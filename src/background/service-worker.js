@@ -45,6 +45,55 @@ const downloadReservations = {
 };
 const pendingNativeDownloadFilenames = [];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let backgroundDaemonTimerId = null;
+
+function startBackgroundDownloadDaemon() {
+  if (backgroundDaemonTimerId) return;
+  backgroundDaemonTimerId = setInterval(async () => {
+    if (!runtimeState.queueRunning) return;
+    const tasks = ledger.listTasks().filter((task) => {
+      const status = String(task.status || "").toLowerCase();
+      const outputLedger = deriveTaskOutputLedger(task);
+      const shouldAutoDownload = task.download?.enabled === true;
+      
+      // Chỉ quan tâm task đã xong (hoặc gần xong) nhưng chưa tải đủ
+      const isCandidate = (status === "complete" || status === "done" || outputLedger.isFinished) 
+        && outputLedger.savedCount < outputLedger.expectedDownloadCount
+        && shouldAutoDownload;
+      
+      if (!isCandidate) return false;
+
+      // Kiểm tra xem có đang bị "khóa" bởi một download đang chạy không
+      const pendingIds = outputLedger.pendingDownloadIds || [];
+      const retryIds = outputLedger.retryDownloadIds || [];
+      const candidateIds = [...pendingIds, ...retryIds];
+      
+      const isLocked = candidateIds.some((mediaId) => {
+        const artifactKey = `${outputLedger.kind}:${mediaId}:original`;
+        return downloadReservations.artifacts.has(artifactKey);
+      });
+
+      return !isLocked;
+    });
+
+    if (tasks.length > 0) {
+      // ÉP TRẠNG THÁI: Nếu task đã isFinished nhưng status vẫn là generating,
+      // thì phải chuyển sang complete trước khi gọi autoDownload.
+      for (const t of tasks) {
+        const outputLedger = deriveTaskOutputLedger(t);
+        if (outputLedger.isFinished && String(t.status || "").toLowerCase() === "generating") {
+          ledger.updateTask(t.id, { 
+            status: "complete", 
+            completedAt: t.completedAt || new Date().toISOString() 
+          });
+        }
+      }
+      
+      recordEvent({ type: "daemon.auto_download_trigger", count: tasks.length, taskIds: tasks.map((t) => t.id) });
+      await autoDownloadCompletedTasks(tasks.map((t) => t.id), "daemon_retry");
+    }
+  }, 10000); // Mỗi 10 giây (nhanh hơn)
+}
 const RECOVERABLE_GLOBAL_HEAL_ACTIONS = new Set(["cooldown_and_refresh", "reconnect_flow", "wait_for_capacity", "backoff"]);
 const MAX_GLOBAL_RECOVERY_ATTEMPTS = 4;
 const licenseClient = createLicenseClient({
@@ -996,7 +1045,11 @@ function generatedDownloadIdsForTask(task = {}) {
 }
 
 function pendingAutoDownloadIdsForTask(task = {}) {
-  if (task?.download?.enabled !== true) return [];
+  if (task?.download?.enabled !== true) {
+    // Không có auto-download config → trả về rỗng (behavior cũ giữ nguyên).
+    // Download sẽ được xử lý qua fallback plans trong autoDownloadCompletedTasks.
+    return [];
+  }
   return deriveTaskOutputLedger(task).pendingDownloadIds;
 }
 
@@ -1292,19 +1345,67 @@ async function autoDownloadCompletedTasks(taskIds = [], reason = "completion") {
   const allDownloads = [];
 
   for (const taskId of ids) {
+    // Cưỡng chế đồng bộ với Gallery hiện tại trước khi tải.
+    await reconcileTaskFromKnownGallery(taskId, "pre_download");
     let task = ledger.getTask(taskId);
     if (!task) continue;
+    
+    // Safety settle: nếu vẫn chưa có outputs, chờ nhẹ một chút.
+    if (!task.outputs?.length && !task.outputMediaIds?.length) {
+      await sleep(150);
+      task = ledger.getTask(taskId) || task;
+    }
 
-    // Only download if terminal or explicitly complete
     const status = String(task.status || "").toLowerCase();
-    if (!["complete", "done", "generating"].includes(status)) continue;
-    if (task.download?.enabled === false) continue;
+    const outputLedger = deriveTaskOutputLedger(task);
+    const finishedGenerating = status === "generating" && outputLedger.resultCount >= outputLedger.expectedCount && outputLedger.expectedCount > 0;
+    
+    // ÉP TRẠNG THÁI: Nếu task thực tế đã xong nhưng status vẫn là generating.
+    if (finishedGenerating) {
+      ledger.updateTask(task.id, { 
+        status: "complete", 
+        completedAt: task.completedAt || new Date().toISOString() 
+      });
+      task = ledger.getTask(taskId) || task;
+    }
+
+    if (!["complete", "done"].includes(String(task.status || "").toLowerCase()) && !finishedGenerating) continue;
+    // KHÔNG skip khi download.enabled=false — vẫn thử fallback path.
+    // (Task được chủ động add vào autoDownload list thì vẫn nên tải.)
 
     if (taskMediaKind(task) === "videos") {
       task = await refreshVideoDownloadReadinessForTask(task);
     }
 
-    const mediaIds = pendingAutoDownloadIdsForTask(task);
+    // Lấy pending IDs từ output ledger.
+    // Nếu có lỗi, chúng ta cũng đưa vào để thử lại nếu số lần retry còn ít.
+    const maxDownloadRetries = 3;
+    const currentRetries = Number(task.downloadRetryCount || 0);
+    let mediaIds = outputLedger.pendingDownloadIds || [];
+    
+    if (!mediaIds.length && outputLedger.retryDownloadIds?.length > 0 && currentRetries < maxDownloadRetries) {
+      mediaIds = outputLedger.retryDownloadIds;
+      // Xóa lỗi cũ để orchestrator cho phép tải lại
+      ledger.updateTask(task.id, { 
+        downloadErrorMediaIds: [], 
+        downloadRetryCount: currentRetries + 1 
+      });
+      recordEvent({ type: "media.download.auto_retry_triggered", taskId: task.id, count: currentRetries + 1, mediaIds });
+    } else if (mediaIds.length > 0 && outputLedger.hasDownloadErrors) {
+      // Nếu có pending IDs nhưng cũng có lỗi cũ (có thể do downloadErrorIds chưa sạch),
+      // thì dọn dẹp lỗi cũ để đảm bảo lần này chạy được.
+      ledger.updateTask(task.id, { downloadErrorMediaIds: [] });
+    }
+
+    // Fallback: khi download.enabled=false hoặc outputs chưa reconcile
+    if (!mediaIds.length) {
+      mediaIds = generatedDownloadIdsForTask(task).filter((id) => {
+        const downloaded = new Set((task.downloadedMediaIds || []).map(compactString).filter(Boolean));
+        const skipped = new Set((task.skippedDownloadMediaIds || []).map(compactString).filter(Boolean));
+        return !downloaded.has(id) && !skipped.has(id);
+      });
+    }
+
     if (!mediaIds.length) continue;
 
     const folder = String(task.download?.folder || "Auto-Flow-01");
@@ -1335,28 +1436,41 @@ async function autoDownloadCompletedTasks(taskIds = [], reason = "completion") {
       reservedTargetPaths: [...downloadReservations.targets.keys()]
     });
 
-    // Fallback: nếu gallery không có item (do sync chậm), build plan thẳng từ task outputs
+    // Fallback: nếu gallery không có item (do sync chậm), build plan thẳng từ task outputs hoặc mediaIds
     if (plans.length === 0) {
-      const outputs = Array.isArray(task.outputs) ? task.outputs : [];
-      const pendingIds = new Set(mediaIds);
       const kind = taskMediaKind(task);
-      for (const output of outputs) {
-        if (!output?.mediaId || !pendingIds.has(output.mediaId)) continue;
-        const mediaUrl = output.mediaUrl || buildMediaRedirectUrl({ mediaId: output.mediaId });
+      const pendingIds = new Set(mediaIds);
+
+      // Ưu tiên task.outputs nếu có
+      const outputsWithUrl = (Array.isArray(task.outputs) ? task.outputs : [])
+        .filter((o) => o?.mediaId && pendingIds.has(o.mediaId));
+
+      // Nếu outputs rỗng nhưng mediaIds có data (trường hợp image task dùng gallery scan),
+      // build plan thẳng từ mediaIds với redirect URL.
+      const sourceIds = outputsWithUrl.length
+        ? outputsWithUrl.map((o) => o.mediaId)
+        : [...pendingIds];
+
+      for (const mediaId of sourceIds) {
+        if (!mediaId) continue;
+        const output = (Array.isArray(task.outputs) ? task.outputs : []).find((o) => o?.mediaId === mediaId) || {};
+        const mediaUrl = output.mediaUrl || output.thumbnailUrl || buildMediaRedirectUrl({ mediaId });
         if (!mediaUrl) continue;
-        const artifactKey = `${kind}:${output.mediaId}:original`;
+        const artifactKey = `${kind}:${mediaId}:original`;
         if (downloadReservations.artifacts.has(artifactKey)) continue;
-        
+        const folder = String(task.download?.folder || "Auto-Flow-01");
+        const ext = kind === "images" ? "jpg" : "mp4";
+
         plans.push({
-          itemId: `${task.id}:${output.mediaId}`,
+          itemId: `${task.id}:${mediaId}`,
           taskId: task.id,
-          mediaId: output.mediaId,
+          mediaId,
           kind,
           url: mediaUrl,
-          filename: `${folder}/${task.id.slice(0, 8)}-${output.mediaId.slice(0, 8)}.${kind === "images" ? "jpg" : "mp4"}`,
+          filename: `${folder}/${task.id.slice(0, 8)}-${mediaId.slice(0, 8)}.${ext}`,
           artifactKey,
           targetPathKey: artifactKey,
-          source: "task-output-fallback",
+          source: "task-media-fallback",
           matchMethod: "direct",
           downloadPath: "direct_named",
           resolution: "",
@@ -1667,8 +1781,11 @@ async function waitForImageTaskOutputs(task = {}, preferredTabId) {
       error: scanResult.error || ""
     });
     if (current.status === TaskStatus.complete) {
-      await autoDownloadCompletedTasks([current.id], "image_reconcile");
-      return current;
+      // Reconcile lại từ gallery hiện tại để đảm bảo outputs[] và outputMediaIds[]
+      // đã được populate TRƯỚC khi gọi download — tránh pendingDownloadIds rỗng.
+      const latestTask = await reconcileTaskFromKnownGallery(current.id, "pre_download_reconcile") || current;
+      await autoDownloadCompletedTasks([latestTask.id], "image_reconcile");
+      return ledger.getTask(current.id) || latestTask;
     }
   }
 
@@ -1693,6 +1810,9 @@ async function waitForImageTaskOutputs(task = {}, preferredTabId) {
       expectedImages: expected,
       failedImages: expected - found
     });
+    
+    // Reconcile trước khi download để outputs[] có đủ data.
+    current = await reconcileTaskFromKnownGallery(current.id, "pre_download_partial_reconcile") || current;
     await autoDownloadCompletedTasks([current.id], "image_partial_timeout");
   }
 
@@ -3691,23 +3811,34 @@ function pumpOverlapQueue(tabId) {
 
   startOverlapTimer(tabId);
 
-  // Proactively check if any active task should unlock the next one
-  // based on latest progress updates (heartbeats).
+  // Proactively check if any active task should unlock the next one.
   const activeTasks = overlapController.getActiveTasks();
   for (const task of activeTasks) {
     overlapController.maybeUnlockFromTask(task.id);
   }
 
+  // FIX: Đếm TỔNG số task đang thực sự chạy = ledger active + main loop task.
+  // Task chạy trong main loop không có trong activeTaskRuns, nhưng có trong
+  // getActiveTasks(). Phải dùng ledger count làm giới hạn thực.
+  const totalActiveCount = Math.max(activeTaskRuns.size, activeTasks.length);
+  const freeSlots = Math.max(0, config.maxConcurrentTasks - totalActiveCount);
+  if (freeSlots <= 0) return;
+
   const tasks = overlapController.pickNextTasksToStart();
   if (!tasks.length) return;
 
-  for (const task of tasks) {
+  // Giới hạn số task start theo freeSlots thực (không để pickNextTasksToStart
+  // trả về nhiều hơn số slot thực sự có).
+  const tasksToStart = tasks.slice(0, freeSlots);
+
+  for (const task of tasksToStart) {
     if (activeTaskRuns.has(task.id)) continue;
 
     recordEvent({
       type: "overlap.start_task",
       taskId: task.id,
       activeCount: activeTaskRuns.size,
+      totalActiveCount,
       config
     });
 
@@ -3715,8 +3846,20 @@ function pumpOverlapQueue(tabId) {
     const submitOnlyVideos = taskMediaKind(task) === "videos";
     const runPromise = (async () => {
       try {
-        const result = await executor.runTask(task.id, { submitOnlyVideos });
+        let result = await executor.runTask(task.id, { submitOnlyVideos });
+        
+        // Cùng logic recovery và wait như main loop để đảm bảo task không bị bỏ rơi.
+        if (!submitOnlyVideos && taskMediaKind(result) === "images" && result?.status !== TaskStatus.generating && result?.status !== TaskStatus.complete) {
+          result = await recoverImageTaskAfterSubmitFailure(result, tabId, "overlap_after_submit");
+        }
+        
+        if (!submitOnlyVideos && result?.status === TaskStatus.generating && taskMediaKind(result) === "images") {
+          result = await waitForImageTaskOutputs(result, tabId);
+        }
+
         if (result?.status === TaskStatus.complete) {
+          // Safety settle: chờ kết quả ghi vào ledger trước khi tải.
+          await sleep(250);
           await autoDownloadCompletedTasks([task.id], "overlap_complete");
         }
         await persistQueueState();
@@ -3755,6 +3898,7 @@ async function runQueueUntilIdle(preferredTabId) {
   const runToken = Number(runtimeState.queueRunToken || 0) + 1;
   runtimeState.queueRunToken = runToken;
   runtimeState.queueRunning = true;
+  startBackgroundDownloadDaemon();
   const isActiveRun = () => runtimeState.queueRunning && runtimeState.queueRunToken === runToken;
   recordEvent({ type: "queue.start", runToken });
   try {
@@ -3858,6 +4002,11 @@ async function runQueueUntilIdle(preferredTabId) {
         if (!isActiveRun()) break;
         const taskToRun = ledger.getTask(nextTask.id) || nextTask;
         const submitOnlyVideos = taskMediaKind(taskToRun) === "videos";
+        
+        // Bắt đầu overlap timer NGAY khi task khởi động, để timer đo thời gian
+        // từ lúc task thực sự chạy (không phải từ lúc submit xong).
+        startOverlapTimer(tab.id);
+
         let task = await executor.runTask(taskToRun.id, { submitOnlyVideos });
         if (!isActiveRun()) break;
         if (!submitOnlyVideos && taskMediaKind(task) === "images" && task?.status !== TaskStatus.generating && task?.status !== TaskStatus.complete) {

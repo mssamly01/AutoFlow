@@ -596,6 +596,12 @@ export function deriveTaskOutputLedger(task = {}) {
     if (kind !== "videos") return true;
     return readyVideoIds.includes(id);
   });
+  const retryDownloadIds = successfulIds.filter((id) => {
+    if (downloadedIds.includes(id) || skippedDownloadIds.includes(id)) return false;
+    if (!downloadErrorIds.includes(id)) return false;
+    if (kind !== "videos") return true;
+    return readyVideoIds.includes(id);
+  });
   return {
     kind,
     expectedCount,
@@ -611,8 +617,10 @@ export function deriveTaskOutputLedger(task = {}) {
     expectedDownloadCount,
     savedCount,
     pendingDownloadIds,
+    retryDownloadIds,
     hasDownloadErrors: downloadErrorIds.length > 0 || (Array.isArray(task.outputs) ? task.outputs : []).some((output) => output?.downloadError || String(output?.downloadStatus || "").toLowerCase() === "download_failed"),
-    isTerminal: ["complete", "done", "failed", "blocked"].includes(String(task.status || "").toLowerCase()) || terminalCount >= expectedCount
+    isTerminal: ["complete", "done", "failed", "blocked"].includes(String(task.status || "").toLowerCase()) || terminalCount >= expectedCount,
+    isFinished: successfulIds.length >= expectedCount && expectedCount > 0
   };
 }
 
@@ -873,10 +881,9 @@ export function reconcileTasksWithGalleryItems(tasks = [], galleryItems = [], no
       patch.lastError = "";
       patch.failureClass = "";
       patch.healAction = "";
-    } else if (task.mode === "text-to-image" && ["complete", "done"].includes(task.status)) {
-      patch.status = "generating";
-      patch.completedAt = "";
     }
+    // REMOVED: risky auto-revert from complete -> generating based on gallery count.
+    // Once complete, it stays complete unless a manual retry is triggered.
 
     const nextStatus = patch.status || task.status || "";
     const materialChanged =
@@ -936,14 +943,13 @@ function feedRowDirectlyClaimedByOtherTask(tasks = [], currentTask = {}, row = {
 }
 
 function normalizedFeedRowStatus(row = {}) {
+  const kind = String(row?.kind || "");
   const status = String(row?.status || "").toLowerCase();
-  if (status && status !== "unknown") return status;
-  if (
-    String(row?.kind || "") === "images" &&
-    (row?.mediaUrl || row?.thumbnailUrl || row?.mediaGenerationId)
-  ) {
+  // For images, if we have media data, it IS complete regardless of status string.
+  if (kind === "images" && (row?.mediaUrl || row?.thumbnailUrl || row?.mediaGenerationId)) {
     return "complete";
   }
+  if (status && status !== "unknown") return status;
   return status || "unknown";
 }
 
@@ -1200,7 +1206,7 @@ export function reconcileTasksWithDownloadResults(tasks = [], downloads = [], no
     const skippedDownloadMediaIdSet = new Set(skippedDownloadMediaIds);
     const downloadErrorMediaIds = [...new Set([
       ...(Array.isArray(task.downloadErrorMediaIds) ? task.downloadErrorMediaIds : []),
-      ...relevant.filter((download) => !download.ok && !download.skipped).map((download) => String(download.mediaId || "").trim()).filter(Boolean)
+      ...relevant.filter((d) => !d.ok && !d.skipped).map((d) => String(d.mediaId || "").trim())
     ])].filter((mediaId) => !downloadedMediaIdSet.has(mediaId) && !skippedDownloadMediaIdSet.has(mediaId));
 
     const expectedCount = expectedOutputCount(task);
@@ -1210,21 +1216,28 @@ export function reconcileTasksWithDownloadResults(tasks = [], downloads = [], no
         ? { foundImages: Math.min(expectedCount, Math.max(Number(task.foundImages || 0) || 0, outputs.filter((output) => output?.mediaId).length, downloadedMediaIds.length)) }
         : {};
 
+    const entryPatch = {
+      outputs,
+      outputMediaIds,
+      downloadedMediaIds,
+      skippedDownloadMediaIds,
+      downloadErrorMediaIds,
+      downloadedCount: downloadedMediaIds.length,
+      skippedDownloadCount: skippedDownloadMediaIds.length,
+      downloadErrorCount: downloadErrorMediaIds.length,
+      hasDownloadErrors: downloadErrorMediaIds.length > 0 || task.hasDownloadErrors,
+      ...foundPatch,
+      lastDownloadAt: now
+    };
+    // Nếu đã tải đủ hết outputs thì ép status thành complete luôn
+    const ledgerAfter = deriveTaskOutputLedger({ ...task, ...entryPatch });
+    if (ledgerAfter.savedCount >= expectedCount && expectedCount > 0) {
+      entryPatch.status = "complete";
+      entryPatch.completedAt = task.completedAt || new Date().toISOString();
+    }
     patches.push({
       taskId: task.id,
-      patch: {
-        outputs,
-        outputMediaIds,
-        downloadedMediaIds,
-        skippedDownloadMediaIds,
-        downloadErrorMediaIds,
-        downloadedCount: downloadedMediaIds.length,
-        skippedDownloadCount: skippedDownloadMediaIds.length,
-        downloadErrorCount: downloadErrorMediaIds.length,
-        hasDownloadErrors: downloadErrorMediaIds.length > 0 || task.hasDownloadErrors,
-        ...foundPatch,
-        lastDownloadAt: now
-      },
+      patch: entryPatch,
       downloadedCount: downloadedMediaIds.length,
       skippedDownloadCount: skippedDownloadMediaIds.length
     });

@@ -1985,11 +1985,13 @@ function liveQueueEffectiveStatus(item = {}, options = {}) {
   const retryStatus = String(item.retryStatus || "").toLowerCase();
   const failedDownloadCount = outputLedger.hasDownloadErrors ? 1 : 0;
   if (status === "pending" && options.queueRunning === true) return "starting";
-  if ((status === "complete" || status === "done") && shouldAutoDownload && failedDownloadCount > 0) return "download_failed";
+  if ((status === "complete" || status === "done") && shouldAutoDownload && (failedDownloadCount > 0 || outputLedger.downloadErrorIds.length > 0)) return "download_failed";
   if ((status === "complete" || status === "done") && resultCount < expectedCount) {
     if (retryStatus === "queued" || retryStatus === "repairing" || retryStatus === "retrying") return "retrying";
     return "partial";
   }
+  // If we are finished and auto-download is disabled, it is complete (don't show "downloading/saving").
+  if ((status === "complete" || status === "done") && !shouldAutoDownload) return "complete";
   if ((status === "complete" || status === "done") && shouldAutoDownload && savedCount < expectedDownloads) return "downloading";
   return status;
 }
