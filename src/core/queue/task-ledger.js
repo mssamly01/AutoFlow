@@ -139,6 +139,17 @@ export function createTaskLedger(initialTasks = []) {
       ...task,
       status: task.status || TaskStatus.pending,
       attempts: Number(task.attempts || 0),
+
+      // Overlap Queue metadata
+      overlapStartedAt: String(task.overlapStartedAt || ""),
+      overlapUnlockedNext: task.overlapUnlockedNext === true,
+      overlapUnlockReason: String(task.overlapUnlockReason || ""),
+      progressPercent: Number.isFinite(Number(task.progressPercent))
+        ? Number(task.progressPercent)
+        : null,
+      progressUpdatedAt: String(task.progressUpdatedAt || ""),
+      lastProgressSource: String(task.lastProgressSource || ""),
+
       mediaIds: Array.isArray(task.mediaIds) ? [...task.mediaIds] : [],
       refMediaIds: Array.isArray(task.refMediaIds) ? [...task.refMediaIds] : [],
       refInputs: Array.isArray(task.refInputs) ? task.refInputs.map((ref) => ({ ...ref })) : [],
@@ -197,6 +208,14 @@ export function createTaskLedger(initialTasks = []) {
         healAction: "",
         failureScope: "",
         partialFailure: false,
+
+        // Reset overlap/progress state.
+        overlapStartedAt: "",
+        overlapUnlockedNext: false,
+        overlapUnlockReason: "",
+        progressPercent: null,
+        progressUpdatedAt: "",
+        lastProgressSource: "",
 
         // Reset output/media cũ.
         mediaIds: [],

@@ -10,6 +10,8 @@ import { activeVideoTaskBeforeComposerRetry } from "../core/queue/video-retry-po
 import { buildGalleryItemsFromTasks, buildPartialVideoCompletionPatch, canonicalGalleryItems, deriveTaskOutputLedger, filterGalleryItemsForProject, filterUsableGalleryItems, planMediaDownloads, reconcileTasksWithDownloadResults, reconcileTasksWithGalleryItems, reconcileTasksWithProjectMediaFeed, referenceMediaIdsFromTasks } from "../core/gallery/media-ledger.js";
 import { buildMediaRedirectUrl, buildMediaThumbnailUrl } from "../core/contracts/api.js";
 import { createDebuggerEngine, releaseDebuggerSessions } from "./debugger-engine.js";
+import { createOverlapController } from "../core/queue/overlap-controller.js";
+import { createAsyncMutex } from "../core/queue/async-mutex.js";
 
 const runtimeState = {
   bridgeHealthy: false,
@@ -54,6 +56,14 @@ const licenseClient = createLicenseClient({
   openTab: async (url) => chrome.tabs.create({ url })
 });
 const queueReady = restoreQueueFromStorage();
+const submitLock = createAsyncMutex();
+const activeTaskRuns = new Map();
+let overlapTimerId = null;
+const overlapController = createOverlapController({
+  ledger,
+  scheduler,
+  getPresets: () => runtimeState.overlapPresets || {}
+});
 
 function recordEvent(event) {
   runtimeState.events.push({
@@ -2204,6 +2214,7 @@ function createExecutorForTab(tabId) {
     scheduler,
     flowClient,
     domSubmitter: createDomSubmitterForTab(tabId),
+    submitLock,
     logger(event = {}) {
       if (event.type === "task_start") {
         recordEvent({
@@ -2450,6 +2461,22 @@ function createExecutorForTab(tabId) {
         }
       }
       return persistQueueState();
+    },
+    async onTaskProgress({ taskId, percent, source } = {}) {
+      overlapController.markTaskProgress(taskId, percent, source);
+      const decision = overlapController.maybeUnlockFromTask(taskId);
+      if (decision.ok) {
+        recordEvent({
+          type: "overlap.unlock_next",
+          taskId,
+          reason: decision.reason,
+          percent,
+          source,
+          activeCount: overlapController.getActiveTasks().length,
+          availableSlots: overlapController.getAvailableSlots()
+        });
+        pumpOverlapQueue(tabId);
+      }
     }
   });
 }
@@ -3613,6 +3640,90 @@ async function resolveContinuityChainForTask(task = {}, tabId = null) {
   return { ok: false, blocked: true, task: blocked, status: result.status, error };
 }
 
+// ---------- Overlap Queue Pump ----------
+function startOverlapTimer(tabId) {
+  if (overlapTimerId) return;
+  overlapTimerId = setInterval(() => {
+    if (!runtimeState.queueRunning) return;
+    const activeTasks = overlapController.getActiveTasks();
+    for (const task of activeTasks) {
+      const decision = overlapController.maybeUnlockFromTask(task.id);
+      if (decision.ok) {
+        recordEvent({
+          type: "overlap.timer_unlock",
+          taskId: task.id,
+          reason: decision.reason,
+          activeCount: activeTasks.length,
+          availableSlots: overlapController.getAvailableSlots()
+        });
+        pumpOverlapQueue(tabId);
+      }
+    }
+  }, 1000);
+}
+
+function stopOverlapTimerIfIdle() {
+  if (!overlapTimerId) return;
+  const hasActive = activeTaskRuns.size > 0 || overlapController.getActiveTasks().length > 0;
+  if (hasActive && runtimeState.queueRunning) return;
+  clearInterval(overlapTimerId);
+  overlapTimerId = null;
+}
+
+function pumpOverlapQueue(tabId) {
+  if (!runtimeState.queueRunning) {
+    stopOverlapTimerIfIdle();
+    return;
+  }
+
+  const config = overlapController.getConfig();
+  if (!config.enabled) return;
+
+  startOverlapTimer(tabId);
+
+  const tasks = overlapController.pickNextTasksToStart();
+  if (!tasks.length) return;
+
+  for (const task of tasks) {
+    if (activeTaskRuns.has(task.id)) continue;
+
+    recordEvent({
+      type: "overlap.start_task",
+      taskId: task.id,
+      activeCount: activeTaskRuns.size,
+      config
+    });
+
+    const executor = createExecutorForTab(tabId);
+    const submitOnlyVideos = taskMediaKind(task) === "videos";
+    const runPromise = (async () => {
+      try {
+        const result = await executor.runTask(task.id, { submitOnlyVideos });
+        if (result?.status === TaskStatus.complete) {
+          await autoDownloadCompletedTasks([task.id], "overlap_complete");
+        }
+        await persistQueueState();
+      } catch (error) {
+        recordEvent({
+          type: "overlap.task_error",
+          taskId: task.id,
+          error: String(error?.message || error || "overlap_task_failed")
+        });
+      }
+    })()
+      .finally(() => {
+        activeTaskRuns.delete(task.id);
+        pumpOverlapQueue(tabId);
+        stopOverlapTimerIfIdle();
+        persistQueueState().catch(() => {});
+      });
+
+    activeTaskRuns.set(task.id, runPromise);
+  }
+
+  persistQueueState().catch(() => {});
+}
+
 async function runQueueUntilIdle(preferredTabId) {
   await queueReady;
   if (runtimeState.queueRunning) return;
@@ -3830,6 +3941,7 @@ async function runQueueUntilIdle(preferredTabId) {
       });
     }
   } finally {
+    stopOverlapTimerIfIdle();
     await releaseDebuggerSessions("queue_finished", recordDebuggerTrace);
     if (runtimeState.queueRunToken === runToken) {
       runtimeState.queueRunning = false;
@@ -4526,6 +4638,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === MessageType.QueueAddJob) {
     (async () => {
       await queueReady;
+      if (message.payload?.presets && typeof message.payload.presets === "object") {
+        runtimeState.overlapPresets = message.payload.presets;
+      }
       const jobs = Array.isArray(message.payload?.jobs) && message.payload.jobs.length
         ? message.payload.jobs
         : (Array.isArray(message.payload?.prompts)
@@ -4610,6 +4725,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       await queueReady;
       captureAuthEnvironment(message.payload || {});
+      if (message.payload?.presets && typeof message.payload.presets === "object") {
+        runtimeState.overlapPresets = message.payload.presets;
+      }
       const next = scheduler.nextPendingTask();
       if (!next) {
         const summary = activeTaskSummary();

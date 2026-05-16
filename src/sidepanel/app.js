@@ -4247,7 +4247,8 @@ async function enqueueJobs(prebuiltJobs = null, options = {}) {
     projectId: leadJob.projectId || state.runtime.projectId,
     submitPath: leadJob.submitPath || state.control.presets.submitPath,
     videoLength: leadJob.videoLength || state.control.presets.videoLength,
-    ...settings
+    ...settings,
+    presets: state.control.presets
   });
   applyRuntimePayload(response?.payload || {});
   if (Number(response?.payload?.added || 0) > 0) {
@@ -4314,7 +4315,7 @@ async function runQueue() {
   state.ui.activeRoute = "live";
   await persistState();
   render();
-  const response = await send(MessageType.QueueStart, { environment: authEnvironment() });
+  const response = await send(MessageType.QueueStart, { environment: authEnvironment(), presets: state.control.presets });
   applyRuntimePayload(response?.payload || {});
   scheduleRuntimeRefresh(0);
   scheduleLiveQueueRefreshBurst();

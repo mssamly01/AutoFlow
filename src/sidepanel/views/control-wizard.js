@@ -1065,6 +1065,40 @@ function buildStep3Body(state, prompts, refs, mode) {
     ),
   );
 
+  const overlapEnabled = presets.overlapEnabled === true;
+  const overlapOptions = [["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"]];
+  const overlapCard = el("div", { class: "afw-gen-card afw-overlap-card" },
+    row(
+      "speed",
+      "Overlap Queue",
+      overlapEnabled ? "Tasks will overlap when progress or timer triggers" : "Disabled — tasks run sequentially",
+      el("label", { class: "afw-toggle-wrap" },
+        el("input", {
+          attrs: { type: "checkbox", ...(overlapEnabled ? { checked: "" } : {}) },
+          data: { settingKey: "overlapEnabled" }
+        }),
+        el("span", { class: "afw-toggle-label", text: overlapEnabled ? "ON" : "OFF" })
+      )
+    ),
+    overlapEnabled
+      ? row("groups", "Concurrent", "Max tasks running at once", valSelect("overlapMaxConcurrentTasks", String(presets.overlapMaxConcurrentTasks || 1), overlapOptions))
+      : null,
+    overlapEnabled
+      ? row("percent", "Trigger %", "Start next task at this progress", el("input", {
+          class: "afw-val-btn",
+          attrs: { type: "number", min: "1", max: "99", value: String(presets.overlapTriggerProgress || 50) },
+          data: { settingKey: "overlapTriggerProgress" }
+        }))
+      : null,
+    overlapEnabled
+      ? row("hourglass_empty", "Fallback sec", "Start next if no progress after", el("input", {
+          class: "afw-val-btn",
+          attrs: { type: "number", min: "5", max: "600", value: String(presets.overlapFallbackSeconds || 45) },
+          data: { settingKey: "overlapFallbackSeconds" }
+        }))
+      : null,
+  );
+
   return el("div", { class: "afw-step-body" },
     el("p", { class: "afw-lede", text: tr(state, "reviewRunHelp") }),
     el("div", { class: "afw-eyebrow" }, icon("checklist"), tr(state, "promptsToReferences"),
@@ -1075,6 +1109,7 @@ function buildStep3Body(state, prompts, refs, mode) {
       el("span", { class: "afw-right", text: tr(state, "settingsOverrideHere") }),
     ),
     settingsCard,
+    overlapCard,
     estimate,
   );
 }

@@ -1,5 +1,15 @@
 import { TaskStatus } from "./task-ledger.js";
 
+export const ACTIVE_TASK_STATUSES = Object.freeze([
+  TaskStatus.submitting,
+  TaskStatus.generating,
+  TaskStatus.downloading
+]);
+
+export function isActiveTaskStatus(status) {
+  return ACTIVE_TASK_STATUSES.includes(status);
+}
+
 function queueErrorText(error) {
   if (error === null || error === undefined) return "";
   if (typeof error === "string") return error;
@@ -108,12 +118,33 @@ export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
       return ledger.listTasks().find((task) => task.status === TaskStatus.pending) || null;
     },
 
+    nextPendingTasks(limit = 1) {
+      const count = Math.max(1, Number(limit || 1));
+      return ledger
+        .listTasks()
+        .filter((task) => task.status === TaskStatus.pending)
+        .slice(0, count);
+    },
+
+    listActiveTasks() {
+      return ledger
+        .listTasks()
+        .filter((task) => isActiveTaskStatus(task.status));
+    },
+
     markSubmitting(taskId) {
       const task = ledger.getTask(taskId);
+      const now = new Date().toISOString();
       return ledger.updateTask(taskId, {
         status: TaskStatus.submitting,
         attempts: Number(task?.attempts || 0) + 1,
-        submitAttemptStartedAt: new Date().toISOString()
+        submitAttemptStartedAt: now,
+        overlapStartedAt: task?.overlapStartedAt || now,
+        overlapUnlockedNext: false,
+        overlapUnlockReason: "",
+        progressPercent: null,
+        progressUpdatedAt: "",
+        lastProgressSource: ""
       });
     },
 
@@ -143,6 +174,7 @@ export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
         failedOutputMediaIds: [],
         ...mediaPatch,
         submittedAt: new Date().toISOString(),
+        overlapStartedAt: task.overlapStartedAt || new Date().toISOString(),
         lastError: "",
         failureClass: "",
         healAction: "",

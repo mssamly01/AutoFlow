@@ -82,6 +82,54 @@ export function extractVideoStatusRows(data) {
   });
 }
 
+function numberFromUnknown(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function percentFromFractionOrPercent(value) {
+  const number = numberFromUnknown(value);
+  if (number === null) return null;
+  if (number > 0 && number <= 1) return Math.round(number * 100);
+  if (number >= 0 && number <= 100) return Math.round(number);
+  return null;
+}
+
+function extractProgressCandidate(value, depth = 0) {
+  if (!value || depth > 6) return null;
+  if (typeof value !== "object") {
+    return percentFromFractionOrPercent(value);
+  }
+  if (Array.isArray(value)) {
+    const values = value
+      .map((entry) => extractProgressCandidate(entry, depth + 1))
+      .filter((entry) => Number.isFinite(Number(entry)));
+    if (!values.length) return null;
+    return Math.round(values.reduce((sum, item) => sum + item, 0) / values.length);
+  }
+  const keys = [
+    "progress", "progressPercent", "percent", "percentage",
+    "completionPercent", "mediaGenerationProgress", "generationProgress"
+  ];
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      const percent = percentFromFractionOrPercent(value[key]);
+      if (percent !== null) return percent;
+    }
+  }
+  for (const child of Object.values(value)) {
+    const percent = extractProgressCandidate(child, depth + 1);
+    if (percent !== null) return percent;
+  }
+  return null;
+}
+
+export function extractProgressPercent(data) {
+  const percent = extractProgressCandidate(data);
+  if (percent === null) return null;
+  return Math.min(100, Math.max(0, percent));
+}
+
 function resultErrorText(result = {}) {
   const parts = [];
   const collect = (value) => {
@@ -190,11 +238,13 @@ export function createQueueExecutor({
   scheduler,
   flowClient,
   domSubmitter = null,
+  submitLock = null,
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   pollIntervalMs = 5000,
   maxPolls = 96,
   logger = () => {},
-  onTaskStateChange = async () => {}
+  onTaskStateChange = async () => {},
+  onTaskProgress = async () => {}
 } = {}) {
   if (!ledger) throw new Error("Queue executor requires a task ledger");
   if (!scheduler) throw new Error("Queue executor requires a scheduler");
@@ -863,7 +913,15 @@ export function createQueueExecutor({
     return repaired;
   }
 
+  async function runSubmitExclusive(fn) {
+    if (submitLock && typeof submitLock.runExclusive === "function") {
+      return submitLock.runExclusive(fn);
+    }
+    return fn();
+  }
+
   async function submit(task) {
+    return runSubmitExclusive(async () => {
     task = await prepareReferenceMediaForSubmit(task);
     const submitPath = submitPathFor(task);
     const domVideoObservationMeta = {};
@@ -938,6 +996,7 @@ export function createQueueExecutor({
       statusText: apiResult.statusText || ""
     });
     return submitViaDom(task, { ...domVideoObservationMeta, apiResult });
+    }); // end runSubmitExclusive
   }
 
   async function pollVideoUntilTerminal(taskId, mediaIds, projectId) {
@@ -953,14 +1012,39 @@ export function createQueueExecutor({
       }
       const statusResult = await flowClient.pollVideoStatus({ projectId, mediaIds });
       const rows = extractVideoStatusRows(statusResult.data);
-      logger({ type: "poll", taskId, poll, maxPolls: taskMaxPolls, rows });
+
+      // Extract progress from poll response for overlap gating.
+      const rowProgressValues = rows
+        .map((row) => Number(row?.progressPercent))
+        .filter((value) => Number.isFinite(value));
+      const progressPercent = rowProgressValues.length
+        ? Math.round(rowProgressValues.reduce((sum, value) => sum + value, 0) / rowProgressValues.length)
+        : extractProgressPercent(statusResult.data);
+
+      logger({ type: "poll", taskId, poll, maxPolls: taskMaxPolls, rows, progressPercent });
+
+      if (Number.isFinite(Number(progressPercent))) {
+        try {
+          await onTaskProgress({ taskId, percent: Number(progressPercent), source: "api" });
+        } catch {}
+      }
+
       const beforeUpdateTask = ledger.getTask(taskId) || {};
       if (beforeUpdateTask.status === TaskStatus.complete || beforeUpdateTask.status === TaskStatus.failed || beforeUpdateTask.status === TaskStatus.blocked) {
         return beforeUpdateTask;
       }
+
+      const progressPatch = Number.isFinite(Number(progressPercent))
+        ? {
+            progressPercent: Number(progressPercent),
+            progressUpdatedAt: new Date().toISOString(),
+            lastProgressSource: "api"
+          }
+        : {};
       ledger.updateTask(taskId, {
         statusRows: rows,
-        lastPollAt: new Date().toISOString()
+        lastPollAt: new Date().toISOString(),
+        ...progressPatch
       });
       await notifyTaskStateChange(taskId, "video_poll");
       const afterNotifyTask = ledger.getTask(taskId) || {};
