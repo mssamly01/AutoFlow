@@ -2312,13 +2312,18 @@ async function removeQueueItem(taskId) {
 async function regenerateTask(taskId) {
   const id = String(taskId || "").trim();
   if (!id) return;
-  const sourceTask = (state.queue.items || []).find((item) => String(item?.id || "") === id);
+
+  const sourceTask = (state.queue.items || []).find(
+    (item) => String(item?.id || "") === id || String(item?.jobId || "") === id
+  );
+
   if (!sourceTask) {
     appendLog("warn", "queue", "Regenerate failed: task not found.");
     await persistState();
     render();
     return;
   }
+
   const prompt = String(sourceTask.prompt || "").trim();
   if (!prompt) {
     appendLog("warn", "queue", "Regenerate failed: original task has no prompt.");
@@ -2326,77 +2331,33 @@ async function regenerateTask(taskId) {
     render();
     return;
   }
-  const mode = String(sourceTask.mode || state.control.mode || FLOW_MODES.textToImage);
-  let projectId = String(sourceTask.projectId || state.runtime.projectId || "").trim();
-  if (!projectId) {
-    projectId = String(await ensureFlowProject() || state.runtime.projectId || "").trim();
-  }
-  if (!projectId) {
-    appendLog("warn", "queue", "Regenerate failed: no Flow project is connected.");
-    await persistState();
-    render();
-    return;
-  }
-  const repeatCount = Math.max(1, Number(sourceTask.repeatCount || sourceTask.expectedImages || sourceTask.expectedVideos || 1) || 1);
-  const refInputs = Array.isArray(sourceTask.refInputs)
-    ? sourceTask.refInputs.map((ref) => (ref && typeof ref === "object" ? { ...ref } : ref)).filter(Boolean)
-    : [];
-  const startRefInput = sourceTask.startRefInput && typeof sourceTask.startRefInput === "object"
-    ? { ...sourceTask.startRefInput }
-    : null;
-  const endRefInput = sourceTask.endRefInput && typeof sourceTask.endRefInput === "object"
-    ? { ...sourceTask.endRefInput }
-    : null;
-  const refMediaIds = (Array.isArray(sourceTask.refMediaIds) ? sourceTask.refMediaIds : [])
-    .map((entry) => String(entry || "").trim())
-    .filter(Boolean);
-  const fallbackMediaIds = (Array.isArray(sourceTask.mediaIds) ? sourceTask.mediaIds : [])
-    .map((entry) => String(entry || "").trim())
-    .filter(Boolean);
-  const mediaIds = refMediaIds.length ? refMediaIds : fallbackMediaIds;
-  const regeneratedJob = {
-    prompt,
-    sourcePrompt: String(sourceTask.sourcePrompt || sourceTask.prompt || ""),
-    imagePrompt: String(sourceTask.imagePrompt || ""),
-    videoPrompt: String(sourceTask.videoPrompt || ""),
-    sceneTag: String(sourceTask.sceneTag || ""),
-    mode,
-    projectId,
-    model: String(sourceTask.model || (mode === FLOW_MODES.textToImage ? "nano_banana_pro" : "default")),
-    aspectRatio: String(sourceTask.aspectRatio || "landscape"),
-    repeatCount,
-    videoLength: String(sourceTask.videoLength || sourceTask.videoDurationSeconds || state.control.presets.videoLength || "8"),
-    videoDurationSeconds: String(sourceTask.videoDurationSeconds || sourceTask.videoLength || state.control.presets.videoLength || "8"),
-    submitPath: String(sourceTask.submitPath || sourceTask.submitPathPreference || state.control.presets.submitPath || "api_first"),
-    refInputs,
-    startRefInput,
-    endRefInput,
-    mediaIds,
-    startMediaId: String(sourceTask.startMediaId || startRefInput?.mediaId || ""),
-    endMediaId: String(sourceTask.endMediaId || endRefInput?.mediaId || ""),
-    returnSilentVideos: sourceTask.returnSilentVideos !== false
-  };
-  if (sourceTask.download && typeof sourceTask.download === "object") {
-    regeneratedJob.download = { ...sourceTask.download };
-  }
-  const { added } = await enqueueJobs([regeneratedJob], { modeOverride: mode });
-  if (added > 0) {
-    state.ui.activeRoute = "live";
-    state.ui.galleryTab = mode === FLOW_MODES.textToImage ? "images" : "videos";
-    appendLog("info", "queue", `Regenerate queued for task ${id.slice(0, 8)}.`);
-    await persistState();
-    render();
-    if (!state.queue.running) {
-      await runQueue();
-    } else {
-      scheduleRuntimeRefresh(0);
-      scheduleLiveQueueRefreshBurst();
+
+  const response = await send(MessageType.QueueResetTask, { id }).catch((error) => ({
+    payload: {
+      error: error?.message || String(error || "Unknown error")
     }
+  }));
+
+  if (response?.payload?.error) {
+    appendLog("warn", "queue", `Regenerate failed: ${response.payload.error}`);
+    await persistState();
+    render();
     return;
   }
-  appendLog("warn", "queue", "Regenerate failed: could not add a new queue task.");
+
+  applyRuntimePayload(response?.payload || {});
+
+  const mode = String(sourceTask.mode || state.control.mode || FLOW_MODES.textToImage);
+  state.ui.activeRoute = "live";
+  state.ui.galleryTab = mode === FLOW_MODES.textToImage ? "images" : "videos";
+
+  appendLog("info", "queue", `Regenerate reset task ${id.slice(0, 8)}.`);
+
   await persistState();
   render();
+
+  scheduleRuntimeRefresh(0);
+  scheduleLiveQueueRefreshBurst();
 }
 
 async function openChromeSettings(url, label) {

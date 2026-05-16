@@ -4721,6 +4721,71 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === MessageType.QueueResetTask) {
+    (async () => {
+      await queueReady;
+      const taskId = String(message.payload?.id || "").trim();
+      if (!taskId) {
+        sendResponse(createMessage(MessageType.QueueResetTask, { ok: false, error: "Missing task id" }));
+        return;
+      }
+
+      const task = ledger.getTask(taskId);
+      if (!task) {
+        sendResponse(createMessage(MessageType.QueueResetTask, { ok: false, error: `Unknown task id: ${taskId}` }));
+        return;
+      }
+
+      const mode = String(task.mode || "");
+
+      const expectedPatch =
+        mode === "text-to-image"
+          ? {
+              expectedImages: Math.max(
+                1,
+                Number(task.repeatCount || task.expectedImages || 1) || 1
+              ),
+              foundImages: 0,
+              expectedVideos: 0,
+              foundVideos: 0
+            }
+          : {
+              expectedVideos: Math.max(
+                1,
+                Number(task.repeatCount || task.expectedVideos || 1) || 1
+              ),
+              foundVideos: 0,
+              expectedImages: 0,
+              foundImages: 0
+            };
+
+      const resetTask = ledger.resetTaskForRegenerate(taskId, expectedPatch);
+
+      await persistQueueState();
+
+      recordEvent({
+        type: "queue.task.regenerate",
+        taskId,
+        mode: resetTask.mode,
+        status: resetTask.status,
+        regenerateCount: resetTask.regenerateCount || 1
+      });
+
+      // Nếu queue chưa chạy, start/resume để pending task được xử lý ngay.
+      if (!runtimeState.queueRunning) {
+        runQueueUntilIdle(Number(message.payload?.tabId || sender?.tab?.id || 0) || undefined);
+      }
+
+      sendResponse(createMessage(MessageType.QueueResetTask, {
+        ok: true,
+        task: resetTask,
+        queue: queueState(),
+        queueRunning: true
+      }));
+    })();
+    return true;
+  }
+
   if (message.type === MessageType.QueuePrune) {
     (async () => {
       await queueReady;

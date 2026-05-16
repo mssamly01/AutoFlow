@@ -15,6 +15,7 @@ export const MessageType = Object.freeze({
   QueueStop: "af.rebuild.queue.stop",
   QueueClear: "af.rebuild.queue.clear",
   QueueRemove: "af.rebuild.queue.remove",
+  QueueResetTask: "af.rebuild.queue.resetTask",
   QueuePrune: "af.rebuild.queue.prune",
   MediaUpload: "af.rebuild.media.upload",
   MediaDownload: "af.rebuild.media.download",

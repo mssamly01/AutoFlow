@@ -175,6 +175,72 @@ export function createTaskLedger(initialTasks = []) {
       return next;
     },
 
+    resetTaskForRegenerate(id, patch = {}) {
+      const current = tasks.get(String(id));
+      if (!current) throw new Error(`Unknown task id: ${id}`);
+
+      const resetPatch = {
+        // Cho scheduler nhặt lại chính task này.
+        status: TaskStatus.pending,
+
+        // Reset vòng chạy.
+        attempts: 0,
+        submitAttemptStartedAt: "",
+        submittedAt: "",
+        completedAt: "",
+
+        // Reset lỗi.
+        lastError: "",
+        failureClass: "",
+        healAction: "",
+        failureScope: "",
+        partialFailure: false,
+
+        // Reset output/media cũ.
+        mediaIds: [],
+        outputMediaIds: [],
+        outputs: [],
+        statusRows: [],
+        submitOutputRows: [],
+        downloadedMediaIds: [],
+        skippedDownloadMediaIds: [],
+        downloadErrorMediaIds: [],
+        downloadedCount: 0,
+
+        // Reset đếm output theo mode.
+        expectedImages: 0,
+        foundImages: 0,
+        expectedVideos: 0,
+        foundVideos: 0,
+        failedOutputCount: 0,
+        failedOutputMediaIds: [],
+
+        // Metadata để UI/debug biết đây là regenerate trên task cũ.
+        regeneratedAt: new Date().toISOString(),
+        regenerateCount: Number(current.regenerateCount || 0) + 1,
+
+        ...patch
+      };
+
+      const next = {
+        ...current,
+        ...resetPatch,
+        events: [
+          ...(Array.isArray(current.events) ? current.events : []),
+          {
+            at: new Date().toISOString(),
+            patch: sanitizeTaskEventPatch({
+              action: "regenerate.reset",
+              ...resetPatch
+            })
+          }
+        ]
+      };
+
+      tasks.set(String(id), next);
+      return next;
+    },
+
     getTask(id) {
       return tasks.get(String(id)) || null;
     },
