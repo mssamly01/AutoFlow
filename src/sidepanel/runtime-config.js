@@ -127,9 +127,9 @@ export function createDefaultState(now = new Date().toISOString()) {
         autopilotT2IToF2V: "off",
 
         // Overlap Queue
-        overlapEnabled: false,
+        overlapEnabled: true,
         overlapMaxConcurrentTasks: 1,
-        overlapDelaySeconds: 30
+        overlapDelaySeconds: 20
       }
     },
     queue: {
@@ -327,9 +327,9 @@ function normalizePresets(presets = {}, sourceVersion = 0) {
   out.mapLineRefs = Boolean(out.mapLineRefs);
   out.autoStartNextJob = Boolean(out.autoStartNextJob);
   out.autoRetryFailedUntilZero = Boolean(out.autoRetryFailedUntilZero);
-  out.overlapEnabled = out.overlapEnabled === true;
+  out.overlapEnabled = out.overlapEnabled !== false;
   out.overlapMaxConcurrentTasks = clampInt(out.overlapMaxConcurrentTasks, 1, 4, 1);
-  out.overlapDelaySeconds = clampInt(out.overlapDelaySeconds, 5, 600, 30);
+  out.overlapDelaySeconds = clampInt(out.overlapDelaySeconds, 5, 600, 20);
   return out;
 }
 

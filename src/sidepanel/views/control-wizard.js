@@ -1018,6 +1018,11 @@ function buildStep3Body(state, prompts, refs, mode) {
     ["one", tr(state, "autopilotOne")],
   ];
   const autopilotReady = mode.key === FLOW_MODES.textToImage && promptsHaveAutopilotVideoPrompts(prompts);
+
+  // Đọc trực tiếp từ Settings – bước 3 không có toggle riêng.
+  const overlapEnabled = presets.overlapEnabled === true;
+  const overlapOptions = [["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"]];
+
   const settingsCard = el("div", { class: "afw-gen-card" },
     row("tune", tr(state, "model"), tr(state, "modeModelList", { mode: modeName(state, mode) }), valSelect(modelKey, presets[modelKey], modelOptions)),
     row("aspect_ratio", tr(state, "aspectRatio"), tr(state, "outputFrame"), valSelect(aspectKey, presets[aspectKey], aspectOptions)),
@@ -1036,6 +1041,15 @@ function buildStep3Body(state, prompts, refs, mode) {
       : null,
     row("download", tr(state, "autoDownload"), autoDownloadOn ? tr(state, "savesToDownloads") : tr(state, "reviewInGalleryFirst"), valSelect(dlResKey, dl, downloadOptions)),
     row("verified_user", tr(state, "submitRoute"), tr(state, "submitRouteHelp"), valSelect("submitPath", presets.submitPath, routeOptions)),
+    // Overlap nằm chung khối Generation.
+    overlapEnabled
+      ? row(
+          "speed",
+          "Overlap",
+          "ON · Tasks start before previous completes",
+          valSelect("overlapMaxConcurrentTasks", String(presets.overlapMaxConcurrentTasks || 1), overlapOptions)
+        )
+      : null,
     // T2I autopilot: animate generated images via Frame-to-Video after the
     // T2I run finishes. Only visible in textToImage mode — other modes
     // already produce video. See issue #208.
@@ -1065,9 +1079,7 @@ function buildStep3Body(state, prompts, refs, mode) {
     ),
   );
 
-  // Đọc trực tiếp từ Settings – bước 3 không có toggle riêng.
-  const overlapEnabled = presets.overlapEnabled === true;
-  const overlapOptions = [["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"]];
+
 
   return el("div", { class: "afw-step-body" },
     el("p", { class: "afw-lede", text: tr(state, "reviewRunHelp") }),
@@ -1079,23 +1091,6 @@ function buildStep3Body(state, prompts, refs, mode) {
       el("span", { class: "afw-right", text: tr(state, "settingsOverrideHere") }),
     ),
     settingsCard,
-    // Overlap chỉ hiện khi được bật trong Settings – nằm chung khối Generation.
-    overlapEnabled
-      ? el("div", { class: "afw-gen-card afw-overlap-card" },
-          row(
-            "speed",
-            "Overlap Queue",
-            "ON · Tasks start before previous completes",
-            el("span", { class: "afw-val-btn", attrs: { disabled: "disabled", style: "opacity:0.7; cursor:default;" }, text: "ON" })
-          ),
-          row(
-            "groups",
-            "Concurrent",
-            "Max tasks running at once",
-            valSelect("overlapMaxConcurrentTasks", String(presets.overlapMaxConcurrentTasks || 1), overlapOptions)
-          ),
-        )
-      : null,
     estimate,
   );
 }
