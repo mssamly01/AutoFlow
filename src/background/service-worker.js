@@ -3709,6 +3709,14 @@ function pumpOverlapQueue(tabId) {
           taskId: task.id,
           error: String(error?.message || error || "overlap_task_failed")
         });
+        const currentTask = ledger.getTask(task.id);
+        if (currentTask && (currentTask.status === TaskStatus.submitting || currentTask.status === TaskStatus.pending || currentTask.status === TaskStatus.starting)) {
+          ledger.updateTask(task.id, {
+            status: TaskStatus.failed,
+            failureClass: "overlap_task_failed",
+            lastError: String(error?.message || error || "overlap_task_failed")
+          });
+        }
       }
     })()
       .finally(() => {

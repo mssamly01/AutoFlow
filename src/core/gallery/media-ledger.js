@@ -1197,6 +1197,11 @@ export function reconcileTasksWithDownloadResults(tasks = [], downloads = [], no
       ...(Array.isArray(task.skippedDownloadMediaIds) ? task.skippedDownloadMediaIds : []),
       ...relevant.filter((download) => download.skipped).map((download) => String(download.mediaId || "").trim()).filter(Boolean)
     ])].filter((mediaId) => !downloadedMediaIdSet.has(mediaId));
+    const skippedDownloadMediaIdSet = new Set(skippedDownloadMediaIds);
+    const downloadErrorMediaIds = [...new Set([
+      ...(Array.isArray(task.downloadErrorMediaIds) ? task.downloadErrorMediaIds : []),
+      ...relevant.filter((download) => !download.ok && !download.skipped).map((download) => String(download.mediaId || "").trim()).filter(Boolean)
+    ])].filter((mediaId) => !downloadedMediaIdSet.has(mediaId) && !skippedDownloadMediaIdSet.has(mediaId));
 
     const expectedCount = expectedOutputCount(task);
     const foundPatch = kind === "videos"
@@ -1212,8 +1217,11 @@ export function reconcileTasksWithDownloadResults(tasks = [], downloads = [], no
         outputMediaIds,
         downloadedMediaIds,
         skippedDownloadMediaIds,
+        downloadErrorMediaIds,
         downloadedCount: downloadedMediaIds.length,
         skippedDownloadCount: skippedDownloadMediaIds.length,
+        downloadErrorCount: downloadErrorMediaIds.length,
+        hasDownloadErrors: downloadErrorMediaIds.length > 0 || task.hasDownloadErrors,
         ...foundPatch,
         lastDownloadAt: now
       },
@@ -1335,7 +1343,6 @@ function downloadSlotGroupKey(item = {}, taskNumber = 1) {
 
 function plannedTaskNumber(item = {}, fallback = 1) {
   if (item.taskNumber !== undefined || item.jobIndex !== undefined) return itemTaskNumber(item, fallback);
-  if (item.taskId || item.jobId) return 1;
   return itemTaskNumber(item, fallback);
 }
 
