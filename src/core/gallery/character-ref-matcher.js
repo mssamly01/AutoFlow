@@ -150,7 +150,10 @@ export function ensureTaskInlineCharacterRefs(task = {}, allRefInputs = []) {
         fileName,
         role: "character_reference"
       });
+    } else {
+      throw new Error(`Missing reference image for character: ${characterName}`);
     }
+
   }
 
   return {

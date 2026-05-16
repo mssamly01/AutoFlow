@@ -152,13 +152,24 @@
     throw new Error(`Reference chip not found: ${fileName}`);
   }
 
-  async function selectMentionResult(result) {
-    result.scrollIntoView?.({ block: 'center' });
+  async function selectMentionResult(result, fileName) {
+    result.scrollIntoView?.({ block: "center" });
     await sleep(150);
+
     result.click();
-    await sleep(100);
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
-    await sleep(200);
+    await sleep(300);
+
+    const chipAfterClick = findReferenceChipByFileName(fileName);
+    if (chipAfterClick) return;
+
+    const input = getPromptInput();
+    input?.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Enter",
+      code: "Enter",
+      bubbles: true
+    }));
+
+    await sleep(300);
   }
 
   async function insertReferenceChipByMention(fileName, emitDomStage = () => {}) {
@@ -175,7 +186,7 @@
     emitDomStage("mention_search_typed", { searchText });
 
     const result = await waitForMentionResult(fileName);
-    await selectMentionResult(result);
+    await selectMentionResult(result, fileName);
     emitDomStage("mention_item_selected", { fileName });
 
     const chip = await waitForReferenceChip(fileName);
@@ -188,7 +199,12 @@
 
   async function typePromptWithInlineCharacterChips(task = {}, emitDomStage = () => {}) {
     const prompt = String(task.prompt || "");
-    const refInputs = (task.refInputs || []).filter(r => r.role === "character_reference");
+    const refInputs = (task.refInputs || []).filter((r) =>
+      r.role === "character_reference" ||
+      r.characterName ||
+      r.fileName ||
+      r.name
+    );
 
     if (!refInputs.length) {
       await typeTextIntoPrompt(prompt);
@@ -204,8 +220,7 @@
     }).filter(m => m.index >= 0).sort((a, b) => a.index - b.index);
 
     if (!matches.length) {
-      await typeTextIntoPrompt(prompt);
-      return { ok: true, inserted: 0 };
+      throw new Error(`Character names for reference chips not found in prompt: ${refInputs.map(r => r.characterName || r.fileName).join(", ")}`);
     }
 
     let cursor = 0;
@@ -224,7 +239,8 @@
         const outcome = await insertReferenceChipByMention(match.fileName, emitDomStage);
         insertedRefs.push(outcome);
       } catch (e) {
-        console.error("Inline chip injection failed", e);
+        console.error("[AutoFlow][InlineRef] chip injection failed", e);
+        throw e;
       }
 
       await typeTextIntoPrompt(" ");

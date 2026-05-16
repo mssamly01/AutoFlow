@@ -391,22 +391,51 @@ export function createQueueExecutor({
     }
   }
 
+  function normalizeSubmitTaskRefs(task = {}) {
+    const refInputs = Array.isArray(task.refInputs) ? task.refInputs : [];
+
+    return {
+      ...task,
+      refInputs: refInputs.map((ref) => {
+        const fileName = String(
+          ref.fileName ||
+          ref.name ||
+          ref.filename ||
+          ref.originalName ||
+          ""
+        ).trim();
+
+        return {
+          ...ref,
+          fileName,
+          name: fileName || ref.name,
+          characterName: ref.characterName || task.characterName || "",
+          role: ref.role || "character_reference"
+        };
+      })
+    };
+  }
+
   async function submitViaDom(task, meta = {}) {
     if (!domSubmitter || typeof domSubmitter.submitTask !== "function") {
       throw new Error("DOM_SUBMIT_ADAPTER_UNAVAILABLE");
     }
+    
+    const taskForDom = normalizeSubmitTaskRefs(task);
+    
     logger({
       type: "submit_path_start",
-      taskId: task.id,
+      taskId: taskForDom.id,
       path: "dom",
       repairFromApi: Boolean(meta.apiResult),
-      ...taskLogFields(task)
+      ...taskLogFields(taskForDom)
     });
     try {
-      const domSubmitPromise = domSubmitter.submitTask(task, {
-        submitPath: submitPathFor(task),
+      const domSubmitPromise = domSubmitter.submitTask(taskForDom, {
+        submitPath: submitPathFor(taskForDom),
         ...meta
       });
+
       const allowStatusFeedSubmitObservation = meta.allowStatusFeedSubmitObservation === true && meta.allowStatusFeedEarlyResolve === true;
       let cancelStatusFeedObservation = false;
       const observedPromise = allowStatusFeedSubmitObservation && VIDEO_MODES.has(String(task.mode || ""))
