@@ -481,6 +481,15 @@ function mediaIdClaimedByOtherTask(tasks = [], currentTask = {}, mediaId = "") {
 function itemMatchesTask(item = {}, task = {}) {
   const itemKind = String(item.kind || "");
   if (itemKind !== mediaKindForTaskMode(task.mode)) return false;
+
+  // Nếu task đã từng được regenerate trên cùng taskId, mọi gallery item cũ (tạo trước 
+  // thời điểm reset) phải bị loại bỏ để tránh "nhiễm" kết quả cũ.
+  const regeneratedAt = task.regeneratedAt ? Date.parse(task.regeneratedAt) : 0;
+  const itemCreatedAt = item.createdAt ? Date.parse(item.createdAt) : 0;
+  if (regeneratedAt && itemCreatedAt && itemCreatedAt < regeneratedAt - 5000) {
+    return false;
+  }
+
   if (item.taskId && String(item.taskId) === String(task.id || "")) return true;
 
   const mediaId = String(item.mediaId || "").trim();
@@ -497,6 +506,13 @@ function itemMatchesTask(item = {}, task = {}) {
 function itemCreatedInsideTaskWindow(item = {}, task = {}) {
   const itemMs = Date.parse(String(item.createdAt || ""));
   if (!Number.isFinite(itemMs)) return true;
+
+  // Chặn item tạo trước khi task được regenerate (nếu có).
+  const regeneratedAt = task.regeneratedAt ? Date.parse(task.regeneratedAt) : 0;
+  if (regeneratedAt && itemMs < regeneratedAt - 5000) {
+    return false;
+  }
+
   const hasSubmitAttemptOnly = !task.submittedAt && Boolean(task.submitAttemptStartedAt);
   const submittedMs = Date.parse(String(task.submittedAt || task.submitAttemptStartedAt || task.startedAt || ""));
   if (!Number.isFinite(submittedMs)) return true;

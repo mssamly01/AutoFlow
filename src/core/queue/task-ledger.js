@@ -179,6 +179,8 @@ export function createTaskLedger(initialTasks = []) {
       const current = tasks.get(String(id));
       if (!current) throw new Error(`Unknown task id: ${id}`);
 
+      const now = new Date().toISOString();
+
       const resetPatch = {
         // Cho scheduler nhặt lại chính task này.
         status: TaskStatus.pending,
@@ -206,18 +208,27 @@ export function createTaskLedger(initialTasks = []) {
         skippedDownloadMediaIds: [],
         downloadErrorMediaIds: [],
         downloadedCount: 0,
+        skippedDownloadCount: 0,
 
         // Reset đếm output theo mode.
-        expectedImages: 0,
+        expectedImages: Number(current.expectedImages || 0),
         foundImages: 0,
-        expectedVideos: 0,
+        expectedVideos: Number(current.expectedVideos || 0),
         foundVideos: 0,
         failedOutputCount: 0,
         failedOutputMediaIds: [],
 
+        // Clear stale preview-ish fields
+        previewUrl: "",
+        thumbnailUrl: "",
+        coverUrl: "",
+        latestImageUrl: "",
+        latestThumbUrl: "",
+
         // Metadata để UI/debug biết đây là regenerate trên task cũ.
-        regeneratedAt: new Date().toISOString(),
+        regeneratedAt: now,
         regenerateCount: Number(current.regenerateCount || 0) + 1,
+        regenEpoch: Number(current.regenEpoch || 0) + 1,
 
         ...patch
       };
@@ -228,9 +239,10 @@ export function createTaskLedger(initialTasks = []) {
         events: [
           ...(Array.isArray(current.events) ? current.events : []),
           {
-            at: new Date().toISOString(),
+            at: now,
             patch: sanitizeTaskEventPatch({
               action: "regenerate.reset",
+              status: TaskStatus.pending,
               ...resetPatch
             })
           }

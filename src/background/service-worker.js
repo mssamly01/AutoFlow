@@ -932,6 +932,46 @@ function repairQueueDownloadStateFromEvents(reason = "runtime_download_events") 
   return applied;
 }
 
+function purgeTaskRuntimeArtifacts(taskId) {
+  const id = String(taskId || "").trim();
+  if (!id) return 0;
+
+  const before = Array.isArray(runtimeState.events) ? runtimeState.events.length : 0;
+
+  runtimeState.events = (Array.isArray(runtimeState.events) ? runtimeState.events : []).filter((event) => {
+    const eventTaskId = String(event?.taskId || "").trim();
+    if (eventTaskId !== id) return true;
+
+    const type = String(event?.type || "");
+    return ![
+      "media.download",
+      "media.download.error",
+      "media.download.filename_suggest",
+      "media.download.dedupe_blocked",
+      "queue.download_reconcile",
+      "queue.download_repair",
+      "queue.flow_generation_feed",
+      "queue.flow_generation_feed.unmatched",
+      "flow_generation_response"
+    ].includes(type);
+  });
+
+  // Xóa các download reservation cũ của task này để tránh lỗi "duplicate_artifact" khi chạy lại.
+  for (const [key, record] of downloadReservations.artifacts.entries()) {
+    if (String(record.taskId) === id) {
+      downloadReservations.artifacts.delete(key);
+    }
+  }
+  for (const [key, record] of downloadReservations.targets.entries()) {
+    if (String(record.taskId) === id) {
+      downloadReservations.targets.delete(key);
+    }
+  }
+
+  const after = runtimeState.events.length;
+  return Math.max(0, before - after);
+}
+
 function generatedDownloadIdsForTask(task = {}) {
   const referenceIds = new Set([
     ...(Array.isArray(task.refMediaIds) ? task.refMediaIds : []),
@@ -4736,8 +4776,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      const mode = String(task.mode || "");
+      // 1) purge stale runtime artifacts trước
+      const purgedEvents = purgeTaskRuntimeArtifacts(taskId);
 
+      // 2) compute expected counts theo mode
+      const mode = String(task.mode || "");
       const expectedPatch =
         mode === "text-to-image"
           ? {
@@ -4759,19 +4802,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               foundImages: 0
             };
 
+      // 3) reset task runtime state
       const resetTask = ledger.resetTaskForRegenerate(taskId, expectedPatch);
 
+      // 4) persist queue
       await persistQueueState();
 
       recordEvent({
         type: "queue.task.regenerate",
         taskId,
-        mode: resetTask.mode,
         status: resetTask.status,
-        regenerateCount: resetTask.regenerateCount || 1
+        mode: resetTask.mode,
+        regenerateCount: Number(resetTask.regenerateCount || 1),
+        regenEpoch: Number(resetTask.regenEpoch || 1),
+        purgedEvents
       });
 
-      // Nếu queue chưa chạy, start/resume để pending task được xử lý ngay.
+      // 5) restart queue if needed
       if (!runtimeState.queueRunning) {
         runQueueUntilIdle(Number(message.payload?.tabId || sender?.tab?.id || 0) || undefined);
       }
