@@ -51,6 +51,201 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function normalizeDomText(value = "") {
+    return String(value || "").trim().normalize("NFC").toLowerCase().replace(/\s+/g, " ");
+  }
+
+  function stripImageExtension(value = "") {
+    return String(value || "").replace(/\.(png|jpe?g|webp|gif)$/i, "");
+  }
+
+  function getPromptInput() {
+    return (
+      document.querySelector('[role="textbox"][data-slate-editor="true"]') ||
+      document.querySelector('[contenteditable="true"]') ||
+      document.querySelector('[role="textbox"]') ||
+      document.querySelector("textarea")
+    );
+  }
+
+  function getComposerRoot() {
+    const input = getPromptInput();
+    return (
+      input?.closest('[class*="eRRruQ"]') || // Flow specific container
+      input?.closest("form") ||
+      input?.closest("[role='dialog']") ||
+      input?.parentElement ||
+      document.body
+    );
+  }
+
+  async function typeTextIntoPrompt(text = "") {
+    const input = getPromptInput();
+    if (!input) throw new Error("Prompt input not found");
+    input.focus();
+    const value = String(text || "");
+    if (!value) return;
+
+    // Use execCommand for surgical insertion to preserve Slate nodes
+    const ok = document.execCommand?.("insertText", false, value);
+    if (!ok && "value" in input) {
+      input.value = `${input.value || ""}${value}`;
+    }
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    await sleep(50);
+  }
+
+  async function waitForMentionPanel(timeoutMs = 5000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const panels = Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [role="dialog"], div')).filter(node => {
+        const rect = node.getBoundingClientRect();
+        return rect.width > 120 && rect.height > 40 && node.textContent;
+      });
+      if (panels.length) return panels[0];
+      await sleep(150);
+    }
+    throw new Error("Mention panel not found after typing @");
+  }
+
+  function findMentionResultByName(fileName) {
+    const expectedFull = normalizeDomText(fileName);
+    const expectedBase = normalizeDomText(stripImageExtension(fileName));
+    const nodes = Array.from(document.querySelectorAll('[role="option"], [role="menuitem"], button, div, span, [role="button"]'));
+    return nodes.find(node => {
+      const text = normalizeDomText(node.textContent || "");
+      if (!text) return false;
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 30 || rect.height < 10) return false;
+      return text.includes(expectedFull) || text.includes(expectedBase);
+    }) || null;
+  }
+
+  async function waitForMentionResult(fileName, timeoutMs = 8000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const result = findMentionResultByName(fileName);
+      if (result) return result;
+      await sleep(200);
+    }
+    throw new Error(`Mention result not found: ${fileName}`);
+  }
+
+  function findReferenceChipByFileName(fileName, root = getComposerRoot()) {
+    const expectedFull = normalizeDomText(fileName);
+    const expectedBase = normalizeDomText(stripImageExtension(fileName));
+    const nodes = Array.from(root.querySelectorAll('span, button, div, [role="button"]'));
+    return nodes.find(node => {
+      const text = normalizeDomText(node.textContent || "");
+      return text.includes(expectedFull) || text.includes(expectedBase);
+    }) || null;
+  }
+
+  async function waitForReferenceChip(fileName, timeoutMs = 10000) {
+    const root = getComposerRoot();
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const chip = findReferenceChipByFileName(fileName, root);
+      if (chip) return { ok: true, fileName, text: chip.textContent || "" };
+      await sleep(200);
+    }
+    throw new Error(`Reference chip not found: ${fileName}`);
+  }
+
+  async function selectMentionResult(result) {
+    result.scrollIntoView?.({ block: 'center' });
+    await sleep(150);
+    result.click();
+    await sleep(100);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+    await sleep(200);
+  }
+
+  async function insertReferenceChipByMention(fileName, emitDomStage = () => {}) {
+    const input = getPromptInput();
+    if (!input) throw new Error("Prompt input not found");
+    input.focus();
+
+    await typeTextIntoPrompt("@");
+    emitDomStage("mention_triggered", { fileName });
+    await waitForMentionPanel();
+
+    const searchText = stripImageExtension(fileName);
+    await typeTextIntoPrompt(searchText);
+    emitDomStage("mention_search_typed", { searchText });
+
+    const result = await waitForMentionResult(fileName);
+    await selectMentionResult(result);
+    emitDomStage("mention_item_selected", { fileName });
+
+    const chip = await waitForReferenceChip(fileName);
+    return { ok: true, fileName, chip };
+  }
+
+  function getRefFileName(ref = {}) {
+    return String(ref.fileName || ref.name || ref.filename || ref.originalName || "").trim();
+  }
+
+  async function typePromptWithInlineCharacterChips(task = {}, emitDomStage = () => {}) {
+    const prompt = String(task.prompt || "");
+    const refInputs = (task.refInputs || []).filter(r => r.role === "character_reference");
+
+    if (!refInputs.length) {
+      await typeTextIntoPrompt(prompt);
+      return { ok: true, inserted: 0 };
+    }
+
+    // Sort character matches by appearance in prompt
+    const matches = refInputs.map(ref => {
+      const characterName = String(ref.characterName || "").trim();
+      const fileName = getRefFileName(ref);
+      const index = characterName ? prompt.toLowerCase().indexOf(characterName.toLowerCase()) : -1;
+      return { ref, characterName, fileName, index };
+    }).filter(m => m.index >= 0).sort((a, b) => a.index - b.index);
+
+    if (!matches.length) {
+      await typeTextIntoPrompt(prompt);
+      return { ok: true, inserted: 0 };
+    }
+
+    let cursor = 0;
+    const insertedRefs = [];
+    for (const match of matches) {
+      if (match.index < cursor) continue; // Skip overlapping or already handled
+
+      const before = prompt.slice(cursor, match.index);
+      const characterText = prompt.slice(match.index, match.index + match.characterName.length);
+
+      if (before) await typeTextIntoPrompt(before);
+      await typeTextIntoPrompt(characterText);
+      await typeTextIntoPrompt(" "); // Ensure space before @
+
+      try {
+        const outcome = await insertReferenceChipByMention(match.fileName, emitDomStage);
+        insertedRefs.push(outcome);
+      } catch (e) {
+        console.error("Inline chip injection failed", e);
+      }
+
+      await typeTextIntoPrompt(" ");
+      cursor = match.index + match.characterName.length;
+    }
+
+    const rest = prompt.slice(cursor);
+    if (rest) await typeTextIntoPrompt(rest);
+
+    return { ok: true, inserted: insertedRefs.length, refs: insertedRefs };
+  }
+
+  async function attachCharacterReferenceBySimulatedUpload(ref = {}, characterName = "", emitDomStage = () => {}) {
+    // This is now replaced by typePromptWithInlineCharacterChips in the main flow
+    return { ok: true, characterName };
+  }
+
+
+
+
+
   function withAbortTimeout(ms = 2500) {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     if (!controller) return { signal: undefined, cancel: () => {} };
@@ -2477,6 +2672,36 @@
 	    };
 	  }
 
+
+  async function appendPromptEditorText(element, text) {
+    if (!text) return { ok: true };
+    const editor = findSlateEditorObject(element);
+    if (editor && typeof editor.insertText === "function") {
+      try {
+        editor.insertText(text);
+        if (typeof editor.onChange === "function") editor.onChange();
+        await sleep(50);
+        return { ok: true };
+      } catch (e) {
+        console.error("Slate append failed", e);
+      }
+    }
+    
+    // Fallback: execCommand at current selection
+    try {
+      element.focus();
+      const inserted = document.execCommand?.("insertText", false, text) === true;
+      if (inserted) {
+        await notifyPromptEditorChanged(element, editorText(element));
+        return { ok: true };
+      }
+    } catch (e) {
+      console.error("execCommand append failed", e);
+    }
+    return { ok: false };
+  }
+
+
   function normalizeAssetName(name = "") {
     return String(name || "")
       .toLowerCase()
@@ -2532,7 +2757,10 @@
       const normalized = normalizeRefDescriptor(ref, fallbackRole);
       if (normalized) refs.push(normalized);
     };
-    (Array.isArray(task.refInputs) ? task.refInputs : []).forEach((ref) => push(ref));
+    (Array.isArray(task.refInputs) ? task.refInputs : [])
+      .filter(ref => ref?.role !== "character_reference")
+      .forEach((ref) => push(ref));
+
     push(task.startRefInput, "startFrameRef");
     push(task.endRefInput, "endFrameRef");
 
@@ -7896,9 +8124,20 @@
         && !inlineImageUrlForRef(ref)
       ));
     if (["text-to-image", "image-to-video", "start-end-image-to-video", "ingredients-to-video"].includes(mode)) {
-      clearAllIngredients(store);
-      await sleep(180);
+      const hasCharacterChip = (store.getState().ingredients || []).some(ing => {
+        const charRef = (task.refInputs || []).find(r => r.role === "character_reference");
+        return charRef && (ing.title === charRef.characterName || ing.fileName === `${charRef.characterName}.jpeg`);
+      });
+      if (!hasCharacterChip) {
+        clearAllIngredients(store);
+        await sleep(180);
+      } else {
+        // If we have a character chip, we might still want to clear OTHER ingredients
+        // but for now let's just skip full clear to be safe.
+        emitAttachStage("ref_attach_preserve_character_chip");
+      }
     }
+
     const absentFrameSlotClear = await clearAbsentFrameSlotsForTask(store, refs, mode, emitAttachStage);
     if (!absentFrameSlotClear.ok) {
       return {
@@ -9390,13 +9629,46 @@
 	      return { ok: false, action: "domSubmitTask", error: "DOM_PROMPT_EDITOR_NOT_FOUND", failClosed: true };
 	    }
 
-	    const commit = await setPromptEditorText(editor, prompt);
-      emitDomStage("prompt_commit", {
-        ok: Boolean(commit.ok),
-        persisted: commit.persisted || "",
-        requestedPrompt: prompt.slice(0, 260),
-        trace: true
-      });
+      const hasCharacterInjection = (task.refInputs || []).some(r => r.role === "character_reference");
+
+      let commit;
+      if (hasCharacterInjection) {
+        emitDomStage("prompt_character_injection_start");
+        
+        // Step 1: Clear existing content
+        await setPromptEditorText(editor, "");
+        
+        // Step 2: Use the sequential typing flow
+        const typeResult = await typePromptWithInlineCharacterChips(task, emitDomStage);
+        
+        // Step 3: Finalize store state
+        const finalPrompt = editorText(editor);
+        await setPromptStoreText(finalPrompt);
+        
+        commit = { 
+          ok: typeResult.ok, 
+          persisted: finalPrompt,
+          method: "typePromptWithInlineCharacterChips"
+        };
+        
+        emitDomStage("prompt_full_commit", {
+          ok: Boolean(commit.ok),
+          persisted: commit.persisted || "",
+          requestedPrompt: prompt.slice(0, 260),
+          trace: true
+        });
+      } else {
+        commit = await setPromptEditorText(editor, prompt);
+        emitDomStage("prompt_commit", {
+          ok: Boolean(commit.ok),
+          persisted: commit.persisted || "",
+          requestedPrompt: prompt.slice(0, 260),
+          trace: true
+        });
+      }
+
+
+
 	    if (!commit.ok) {
 	      return {
 	        ok: false,
@@ -9406,6 +9678,7 @@
 	        failClosed: true
 	      };
 	    }
+
 
       let attachOutcome = { ok: true, attached: 0, attachedImageIds: [], serializedIds: [] };
 	    if (domTaskRequiresAttach(task)) {

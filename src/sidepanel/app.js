@@ -9,6 +9,8 @@ import { base64FromDataUrl, getReferenceBlob, putReferenceBlob } from "../core/s
 import { FLOW_MODES, STORAGE_KEY, createDefaultState, mergeState } from "./runtime-config.js";
 import { renderControl, renderGallery, renderHistory, renderLiveQueue, renderLogs, renderScenes, renderSettings } from "./views.js";
 import { createGalleryController } from "./gallery-controller.js";
+import { ensureTaskInlineCharacterRefs, inferFirstCharacterNameFromPrompt } from "../core/gallery/character-ref-matcher.js";
+
 
 const ROUTES = {
   control: {
@@ -3736,7 +3738,48 @@ function effectiveTextToImageModel(model = "nano_banana_pro", refInputs = [], op
   return model || "nano_banana_pro";
 }
 
+/**
+ * Enriches a task with character reference inputs by matching character names in the prompt.
+ */
+async function enrichTaskWithCharacterRefs(task) {
+  try {
+    const allRefs = typeof allReferenceItems === "function" ? allReferenceItems() : [];
+    const enriched = ensureTaskInlineCharacterRefs(task, allRefs);
+    
+    if (!enriched?.refInputs?.length) return task;
+
+    // Pre-process refs if we are in dom_first mode to include dataUrls
+    const presets = state?.control?.presets || {};
+    const domFirst = (presets.submitPath || presets.submitPathPreference) === "dom_first";
+    
+    if (domFirst) {
+      const finalRefs = [];
+      for (const ref of enriched.refInputs) {
+        if (ref.role === "character_reference") {
+          const dataUrl = typeof fullDataUrlForReferenceItem === "function" ? await fullDataUrlForReferenceItem(ref) : "";
+          if (dataUrl) {
+            finalRefs.push({ ...ref, dataUrl });
+            continue;
+          }
+        }
+        finalRefs.push(ref);
+      }
+      enriched.refInputs = finalRefs;
+    }
+
+    return enriched;
+  } catch (error) {
+    console.error("enrichTaskWithCharacterRefs failed", error);
+    return task;
+  }
+}
+
+
+
+
+
 async function buildJobs() {
+
   const prompts = jobPromptLinesForRun();
   if (!prompts.length) throw new Error("Add at least one prompt.");
   applyAutoMatchPromptRefMapForRun(prompts, state);
@@ -3772,7 +3815,7 @@ async function buildJobs() {
         : refPairs.map((pair, refIndex) => refInputFromItem(pair.item, pair.role, mediaIds[refIndex] || "", { useStoredMediaId: false }));
       const startRef = refInputs.find((ref) => ref.role === "startFrameRef") || null;
       const endRef = refInputs.find((ref) => ref.role === "endFrameRef") || null;
-      jobs.push({
+      const job = {
         prompt: promptPayload.prompt,
         sourcePrompt: promptPayload.sourcePrompt,
         imagePrompt: promptPayload.imagePrompt,
@@ -3796,7 +3839,10 @@ async function buildJobs() {
         endRefInput: endRef,
         startMediaId: startRef?.mediaId || mediaIds[0] || "",
         endMediaId: endRef?.mediaId || ""
-      });
+      };
+
+      jobs.push(await enrichTaskWithCharacterRefs(job));
+
     }
     return jobs;
   }
@@ -3823,7 +3869,7 @@ async function buildJobs() {
     const refInputs = domFirstInlineRefUpload
       ? await Promise.all(refPairs.map((pair) => domUploadRefInputFromItem(pair.item, pair.role)))
       : refPairs.map((pair, refIndex) => refInputFromItem(pair.item, pair.role, mediaIds[refIndex] || ""));
-    jobs.push({
+    const job = {
       prompt: promptPayload.prompt,
       sourcePrompt: promptPayload.sourcePrompt,
       imagePrompt: promptPayload.imagePrompt,
@@ -3839,7 +3885,9 @@ async function buildJobs() {
       referenceChainMode: continuityChain && index > 0 ? "previous_output" : "",
       referenceChainSeed: continuityChain && index === 0,
       referenceChainIndex: continuityChain ? index : null
-    });
+    };
+    jobs.push(await enrichTaskWithCharacterRefs(job));
+
   }
   return jobs;
 }
