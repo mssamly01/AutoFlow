@@ -3839,6 +3839,7 @@ async function runQueueUntilIdle(preferredTabId) {
           task = await recoverImageTaskAfterSubmitFailure(task, tab.id, "after_submit_result");
         }
         if (!isActiveRun()) break;
+        pumpOverlapQueue(tab.id);
         task = submitOnlyVideos ? task : await waitForImageTaskOutputs(task, tab.id);
         if (!isActiveRun()) break;
         recordEvent({
