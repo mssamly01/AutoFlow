@@ -1,6 +1,6 @@
 // AutoFlow Overlap Queue Controller.
 // Manages concurrency gating: decides when the next task can start
-// based on real API/DOM progress or a time-based fallback.
+// based on a time-based delay (overlapDelaySeconds).
 //
 // Submit remains serialized (via mutex in service-worker).
 // Only generation/polling is overlapped.
@@ -26,13 +26,24 @@ export function normalizeOverlapConfig(presets = {}) {
     maxConcurrentTasks: enabled
       ? clampNumber(presets?.overlapMaxConcurrentTasks, 1, 4, 1)
       : 1,
-    triggerProgress: clampNumber(presets?.overlapTriggerProgress, 1, 99, 50),
-    fallbackSeconds: clampNumber(presets?.overlapFallbackSeconds, 5, 600, 45)
+    delaySeconds: clampNumber(presets?.overlapDelaySeconds, 5, 600, 30)
   };
 }
 
 export function isOverlapActiveTask(task = {}) {
   return ACTIVE_STATUSES.has(task.status);
+}
+
+function getTaskStartedAtMs(task = {}) {
+  const raw =
+    task.overlapStartedAt ||
+    task.submittedAt ||
+    task.submitAttemptStartedAt ||
+    task.startedAt ||
+    "";
+
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export function createOverlapController({
@@ -65,8 +76,22 @@ export function createOverlapController({
   }
 
   function pickNextTasksToStart() {
-    const freeSlots = getAvailableSlots();
+    const config = getConfig();
+    const activeTasks = getActiveTasks();
+    const activeCount = activeTasks.length;
+    const freeSlots = Math.max(0, config.maxConcurrentTasks - activeCount);
+
     if (freeSlots <= 0) return [];
+
+    // If overlap is enabled and we have active tasks, we only start the next one
+    // if at least one active task has unlocked (or if we haven't reached max capacity yet
+    // and the last started task has unlocked).
+    // Actually, the simplest logic is: if we have any active task, 
+    // at least one MUST have overlapUnlockedNext === true to start one more.
+    if (config.enabled && activeCount > 0) {
+      const hasUnlock = activeTasks.some(t => t.overlapUnlockedNext === true);
+      if (!hasUnlock) return [];
+    }
 
     if (typeof scheduler.nextPendingTasks === "function") {
       return scheduler.nextPendingTasks(freeSlots);
@@ -74,22 +99,6 @@ export function createOverlapController({
 
     const one = scheduler.nextPendingTask?.();
     return one ? [one] : [];
-  }
-
-  function markTaskProgress(taskId, percent, source = "unknown") {
-    const task = ledger.getTask(taskId);
-    if (!task) return null;
-
-    const numeric = Number(percent);
-    const progressPercent = Number.isFinite(numeric)
-      ? Math.min(100, Math.max(0, numeric))
-      : null;
-
-    return ledger.updateTask(taskId, {
-      progressPercent,
-      progressUpdatedAt: new Date(now()).toISOString(),
-      lastProgressSource: String(source || "unknown")
-    });
   }
 
   function shouldUnlockNextTask(task = {}) {
@@ -111,28 +120,19 @@ export function createOverlapController({
       return { ok: false, reason: "task_not_active" };
     }
 
-    // Check real API/DOM progress first.
-    const progress = Number(task.progressPercent);
-    if (Number.isFinite(progress) && progress >= config.triggerProgress) {
-      return { ok: true, reason: "progress" };
+    const startedAtMs = getTaskStartedAtMs(task);
+
+    if (!Number.isFinite(startedAtMs)) {
+      return { ok: false, reason: "missing_started_at" };
     }
 
-    // Fall back to time-based gate.
-    const startedAtMs = Date.parse(
-      task.overlapStartedAt ||
-      task.submittedAt ||
-      task.submitAttemptStartedAt ||
-      ""
-    );
+    const elapsedSeconds = Math.max(0, (now() - startedAtMs) / 1000);
 
-    if (Number.isFinite(startedAtMs)) {
-      const elapsedSeconds = Math.max(0, (now() - startedAtMs) / 1000);
-      if (elapsedSeconds >= config.fallbackSeconds) {
-        return { ok: true, reason: "timer" };
-      }
+    if (elapsedSeconds >= config.delaySeconds) {
+      return { ok: true, reason: "timer" };
     }
 
-    return { ok: false, reason: "waiting" };
+    return { ok: false, reason: "waiting", elapsedSeconds, remaining: config.delaySeconds - elapsedSeconds };
   }
 
   function markUnlockedNext(taskId, reason = "unknown") {
@@ -160,7 +160,6 @@ export function createOverlapController({
     getActiveTasks,
     getAvailableSlots,
     pickNextTasksToStart,
-    markTaskProgress,
     shouldUnlockNextTask,
     markUnlockedNext,
     maybeUnlockFromTask

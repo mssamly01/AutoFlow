@@ -1029,8 +1029,7 @@ export function renderSettings(root, state) {
     field("Enable overlap:", controlGroup(checkInput("overlapEnabledCheckbox", presets.overlapEnabled, "overlapEnabled"))),
     el("div", { class: "hint-text wide", text: "Start the next task before the current task fully completes. Submit remains serialized for safety." }),
     field("Max concurrent tasks:", controlGroup(numberInput("overlapMaxConcurrentTasks", presets.overlapMaxConcurrentTasks, "overlapMaxConcurrentTasks", { min: "1", max: "4" }))),
-    field("Start next at progress (%):", controlGroup(numberInput("overlapTriggerProgress", presets.overlapTriggerProgress, "overlapTriggerProgress", { min: "1", max: "99" }))),
-    field("Fallback if no progress (sec):", controlGroup(numberInput("overlapFallbackSeconds", presets.overlapFallbackSeconds, "overlapFallbackSeconds", { min: "5", max: "600" }))),
+    field("Overlap delay (seconds):", controlGroup(numberInput("overlapDelaySeconds", presets.overlapDelaySeconds, "overlapDelaySeconds", { min: "5", max: "600" }))),
 
     subheader("download", "Download Settings"),
     field("Auto-download videos:", controlGroup(checkInput("autoDownloadCheckbox", presets.autoDownload, "autoDownload"))),

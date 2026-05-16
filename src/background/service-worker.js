@@ -1300,92 +1300,64 @@ function filenameWithImageMimeExtension(filename = "", mimeType = "") {
 
 async function autoDownloadCompletedTasks(taskIds = [], reason = "completion") {
   const ids = [...new Set((taskIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
-  const selectedIds = [];
-  const folders = new Set();
-  const projectIds = new Set();
-  const resolutionByTaskId = {};
-  const filenameOptionsByTaskId = {};
+  const allDownloads = [];
+
   for (const taskId of ids) {
     let task = ledger.getTask(taskId);
-    if (!task || task.status !== TaskStatus.complete) continue;
+    if (!task) continue;
+
+    // Only download if terminal or explicitly complete
+    const status = String(task.status || "").toLowerCase();
+    if (!["complete", "done", "generating"].includes(status)) continue;
+    if (task.download?.enabled === false) continue;
+
     if (taskMediaKind(task) === "videos") {
       task = await refreshVideoDownloadReadinessForTask(task);
     }
+
     const mediaIds = pendingAutoDownloadIdsForTask(task);
-    if (!mediaIds.length) {
-      const outputLedger = deriveTaskOutputLedger(task);
-      recordEvent({
-        type: "media.auto_download.no_pending",
-        reason,
-        taskId: task.id,
-        kind: outputLedger.kind,
-        resultCount: outputLedger.resultCount,
-        expectedDownloadCount: outputLedger.expectedDownloadCount,
-        readyVideoIds: outputLedger.readyVideoIds.length,
-        downloaded: outputLedger.downloadedIds.length,
-        skipped: outputLedger.skippedDownloadIds.length,
-        downloadErrors: outputLedger.downloadErrorIds.length,
-        generatedIds: generatedDownloadIdsForTask(task).length,
-        downloadEnabled: task.download?.enabled === true
-      });
-      continue;
-    }
-    folders.add(String(task.download?.folder || "Auto-Flow-01"));
-    if (task.projectId) projectIds.add(String(task.projectId));
-    resolutionByTaskId[String(task.id)] = String(task.download?.resolution || "").trim();
-    filenameOptionsByTaskId[String(task.id)] = {
-      filenameStyle: task.download?.filenameStyle || "",
-      filenameTemplatePrefix: task.download?.filenameTemplatePrefix || "",
-      filenameTemplateIndex: task.download?.filenameTemplateIndex || "",
-      filenameTemplatePromptPart: task.download?.filenameTemplatePromptPart || "",
-      filenameTemplateDate: task.download?.filenameTemplateDate || "",
-      filenameTemplateSuffix: task.download?.filenameTemplateSuffix || "",
-      filenameTemplateSeparator: task.download?.filenameTemplateSeparator || ""
+    if (!mediaIds.length) continue;
+
+    const folder = String(task.download?.folder || "Auto-Flow-01");
+    const resolutionByTaskId = { [task.id]: String(task.download?.resolution || "").trim() };
+    const filenameOptionsByTaskId = {
+      [task.id]: {
+        filenameStyle: task.download?.filenameStyle || "",
+        filenameTemplatePrefix: task.download?.filenameTemplatePrefix || "",
+        filenameTemplateIndex: task.download?.filenameTemplateIndex || "",
+        filenameTemplatePromptPart: task.download?.filenameTemplatePromptPart || "",
+        filenameTemplateDate: task.download?.filenameTemplateDate || "",
+        filenameTemplateSuffix: task.download?.filenameTemplateSuffix || "",
+        filenameTemplateSeparator: task.download?.filenameTemplateSeparator || ""
+      }
     };
-    selectedIds.push(...mediaIds.map((mediaId) => `${task.id}:${mediaId}`));
-  }
-  if (!selectedIds.length) {
-    recordEvent({
-      type: "media.auto_download.no_selection",
-      reason,
-      requestedTasks: ids.length
-    });
-    return [];
-  }
-  const folder = folders.size === 1 ? [...folders][0] : "Auto-Flow-01";
-  const projectId = projectIds.size === 1 ? [...projectIds][0] : runtimeState.lastGalleryProjectId;
-  const gallery = galleryState(runtimeState.lastGalleryItems || [], runtimeState.lastGalleryItems?.length ? "flow-dom+queue-ledger" : "queue-ledger", projectId);
-  const plans = planMediaDownloads(gallery.items, {
-    selectedIds,
-    folder,
-    resolutionByTaskId,
-    filenameOptionsByTaskId,
-    reservedArtifactKeys: [...downloadReservations.artifacts.keys()],
-    reservedTargetPaths: [...downloadReservations.targets.keys()]
-  });
-  if (!plans.length) {
-    recordEvent({
-      type: "media.auto_download.no_plans",
-      reason,
-      selected: selectedIds.length,
-      galleryItems: gallery.items.length,
+    const selectedIds = mediaIds.map((mediaId) => `${task.id}:${mediaId}`);
+
+    // Build a gallery state specifically for this task to avoid project-id filtering issues
+    // but include ledger items so we can find the media URLs.
+    const gallery = galleryState([], "queue-ledger", "");
+    const plans = planMediaDownloads(gallery.items, {
+      selectedIds,
       folder,
-      projectId: projectId || ""
+      resolutionByTaskId,
+      filenameOptionsByTaskId,
+      reservedArtifactKeys: [...downloadReservations.artifacts.keys()],
+      reservedTargetPaths: [...downloadReservations.targets.keys()]
     });
-    return [];
+
+    if (plans.length > 0) {
+      recordEvent({ type: "media.auto_download.start_task", taskId: task.id, reason, planned: plans.length });
+      const downloads = await executeDownloadPlans(plans, "auto");
+      allDownloads.push(...downloads);
+      
+      const reconciledDownloads = reconcileQueueWithDownloadResults(downloads);
+      if (reconciledDownloads.length) {
+        await persistQueueState();
+      }
+    }
   }
-  recordEvent({ type: "media.auto_download.start", reason, planned: plans.length });
-  const downloads = await executeDownloadPlans(plans, "auto");
-  const reconciledDownloads = reconcileQueueWithDownloadResults(downloads);
-  if (reconciledDownloads.length) await persistQueueState();
-  recordEvent({
-    type: "media.auto_download.done",
-    reason,
-    planned: plans.length,
-    downloaded: downloads.filter((download) => download.ok).length,
-    skipped: downloads.filter((download) => download.skipped).length
-  });
-  return downloads;
+
+  return allDownloads;
 }
 
 async function scanFlowGallery(preferredTabId, options = {}) {

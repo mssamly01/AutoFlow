@@ -129,8 +129,7 @@ export function createDefaultState(now = new Date().toISOString()) {
         // Overlap Queue
         overlapEnabled: false,
         overlapMaxConcurrentTasks: 1,
-        overlapTriggerProgress: 50,
-        overlapFallbackSeconds: 45
+        overlapDelaySeconds: 30
       }
     },
     queue: {
@@ -330,8 +329,7 @@ function normalizePresets(presets = {}, sourceVersion = 0) {
   out.autoRetryFailedUntilZero = Boolean(out.autoRetryFailedUntilZero);
   out.overlapEnabled = out.overlapEnabled === true;
   out.overlapMaxConcurrentTasks = clampInt(out.overlapMaxConcurrentTasks, 1, 4, 1);
-  out.overlapTriggerProgress = clampInt(out.overlapTriggerProgress, 1, 99, 50);
-  out.overlapFallbackSeconds = clampInt(out.overlapFallbackSeconds, 5, 600, 45);
+  out.overlapDelaySeconds = clampInt(out.overlapDelaySeconds, 5, 600, 30);
   return out;
 }
 
