@@ -107,12 +107,30 @@ const licenseClient = createLicenseClient({
 const queueReady = restoreQueueFromStorage();
 const submitLock = createAsyncMutex();
 const activeTaskRuns = new Map();
+const activeSubmitRuns = new Map();
+const activeWatchRuns = new Map();
+
 let overlapTimerId = null;
 const overlapController = createOverlapController({
   ledger,
   scheduler,
   getPresets: () => runtimeState.overlapPresets || {}
 });
+
+function logOverlapSubmit(event, taskId, extra = {}) {
+  console.info(`[AutoFlow][OverlapSubmit] ${event}`, {
+    taskId,
+    at: new Date().toISOString(),
+    ...extra
+  });
+
+  recordEvent({
+    type: `overlap_submit.${event}`,
+    taskId,
+    at: new Date().toISOString(),
+    ...extra
+  });
+}
 
 function recordEvent(event) {
   runtimeState.events.push({
@@ -3771,6 +3789,44 @@ async function resolveContinuityChainForTask(task = {}, tabId = null) {
 }
 
 // ---------- Overlap Queue Pump ----------
+function startTaskWatcher(taskId, tabId) {
+  if (!taskId) return;
+  if (activeWatchRuns.has(taskId)) return;
+
+  const watchPromise = (async () => {
+    logOverlapSubmit("WATCH_START", taskId);
+    try {
+      let task = ledger.getTask(taskId);
+      if (!task) return;
+
+      const kind = taskMediaKind(task);
+      if (kind === "images") {
+        await waitForImageTaskOutputs(task, tabId);
+      } else if (kind === "videos") {
+        await waitForVideoTaskOutputs(task, tabId);
+      } else {
+        await waitForImageTaskOutputs(task, tabId);
+      }
+
+      await sleep(250);
+      await autoDownloadCompletedTasks([taskId], "overlap_complete");
+
+      logOverlapSubmit("OUTPUT_DONE", taskId);
+      await persistQueueState();
+    } catch (error) {
+      console.error("[AutoFlow][OverlapWatch] failed", taskId, error);
+      scheduler.markFailure(taskId, error);
+      await persistQueueState();
+    } finally {
+      activeWatchRuns.delete(taskId);
+      pumpOverlapQueue(tabId);
+      stopOverlapTimerIfIdle();
+    }
+  })();
+
+  activeWatchRuns.set(taskId, watchPromise);
+}
+
 function startOverlapTimer(tabId) {
   if (overlapTimerId) return;
   overlapTimerId = setInterval(() => {
@@ -3779,12 +3835,9 @@ function startOverlapTimer(tabId) {
     for (const task of activeTasks) {
       const decision = overlapController.maybeUnlockFromTask(task.id);
       if (decision.ok) {
-        recordEvent({
-          type: "overlap.timer_unlock",
-          taskId: task.id,
+        logOverlapSubmit("UNLOCK_NEXT_TIMER", task.id, {
           reason: decision.reason,
-          activeCount: activeTasks.length,
-          availableSlots: overlapController.getAvailableSlots()
+          activeCount: activeTasks.length
         });
         pumpOverlapQueue(tabId);
       }
@@ -3794,7 +3847,7 @@ function startOverlapTimer(tabId) {
 
 function stopOverlapTimerIfIdle() {
   if (!overlapTimerId) return;
-  const hasActive = activeTaskRuns.size > 0 || overlapController.getActiveTasks().length > 0;
+  const hasActive = activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || overlapController.getActiveTasks().length > 0;
   if (hasActive && runtimeState.queueRunning) return;
   clearInterval(overlapTimerId);
   overlapTimerId = null;
@@ -3817,76 +3870,55 @@ function pumpOverlapQueue(tabId) {
     overlapController.maybeUnlockFromTask(task.id);
   }
 
-  // FIX: Đếm TỔNG số task đang thực sự chạy = ledger active + main loop task.
-  // Task chạy trong main loop không có trong activeTaskRuns, nhưng có trong
-  // getActiveTasks(). Phải dùng ledger count làm giới hạn thực.
-  const totalActiveCount = Math.max(activeTaskRuns.size, activeTasks.length);
+  const totalActiveCount = activeTasks.length;
   const freeSlots = Math.max(0, config.maxConcurrentTasks - totalActiveCount);
   if (freeSlots <= 0) return;
 
   const tasks = overlapController.pickNextTasksToStart();
   if (!tasks.length) return;
 
-  // Giới hạn số task start theo freeSlots thực (không để pickNextTasksToStart
-  // trả về nhiều hơn số slot thực sự có).
   const tasksToStart = tasks.slice(0, freeSlots);
 
   for (const task of tasksToStart) {
-    if (activeTaskRuns.has(task.id)) continue;
+    if (activeSubmitRuns.has(task.id) || activeWatchRuns.has(task.id)) continue;
 
-    recordEvent({
-      type: "overlap.start_task",
-      taskId: task.id,
-      activeCount: activeTaskRuns.size,
-      totalActiveCount,
-      config
-    });
+    logOverlapSubmit("SUBMIT_START", task.id);
 
     const executor = createExecutorForTab(tabId);
-    const submitOnlyVideos = taskMediaKind(task) === "videos";
     const runPromise = (async () => {
       try {
-        let result = await executor.runTask(task.id, { submitOnlyVideos });
-        
-        // Cùng logic recovery và wait như main loop để đảm bảo task không bị bỏ rơi.
-        if (!submitOnlyVideos && taskMediaKind(result) === "images" && result?.status !== TaskStatus.generating && result?.status !== TaskStatus.complete) {
+        scheduler.markSubmitting(task.id);
+        await notifyTaskStateChange(task.id, "submitting");
+
+        let result = await executor.runTask(task.id, { submitOnly: true });
+
+        if (taskMediaKind(result) === "images" && result?.status !== TaskStatus.generating && result?.status !== TaskStatus.complete) {
           result = await recoverImageTaskAfterSubmitFailure(result, tabId, "overlap_after_submit");
         }
-        
-        if (!submitOnlyVideos && result?.status === TaskStatus.generating && taskMediaKind(result) === "images") {
-          result = await waitForImageTaskOutputs(result, tabId);
-        }
 
-        if (result?.status === TaskStatus.complete) {
-          // Safety settle: chờ kết quả ghi vào ledger trước khi tải.
+        logOverlapSubmit("SUBMIT_DONE", task.id, {
+          resultOk: result?.status === TaskStatus.generating || result?.status === TaskStatus.complete
+        });
+
+        if (result?.status === TaskStatus.generating) {
+          startTaskWatcher(task.id, tabId);
+        } else if (result?.status === TaskStatus.complete) {
           await sleep(250);
-          await autoDownloadCompletedTasks([task.id], "overlap_complete");
+          await autoDownloadCompletedTasks([task.id], "overlap_immediate_complete");
         }
         await persistQueueState();
       } catch (error) {
-        recordEvent({
-          type: "overlap.task_error",
-          taskId: task.id,
-          error: String(error?.message || error || "overlap_task_failed")
-        });
-        const currentTask = ledger.getTask(task.id);
-        if (currentTask && (currentTask.status === TaskStatus.submitting || currentTask.status === TaskStatus.pending || currentTask.status === TaskStatus.starting)) {
-          ledger.updateTask(task.id, {
-            status: TaskStatus.failed,
-            failureClass: "overlap_task_failed",
-            lastError: String(error?.message || error || "overlap_task_failed")
-          });
-        }
-      }
-    })()
-      .finally(() => {
-        activeTaskRuns.delete(task.id);
+        logOverlapSubmit("SUBMIT_FAILED", task.id, { error: String(error) });
+        scheduler.markFailure(task.id, error);
+        await persistQueueState();
+      } finally {
+        activeSubmitRuns.delete(task.id);
         pumpOverlapQueue(tabId);
         stopOverlapTimerIfIdle();
-        persistQueueState().catch(() => {});
-      });
+      }
+    })();
 
-    activeTaskRuns.set(task.id, runPromise);
+    activeSubmitRuns.set(task.id, runPromise);
   }
 
   persistQueueState().catch(() => {});
@@ -3904,6 +3936,30 @@ async function runQueueUntilIdle(preferredTabId) {
   try {
     const tab = await findFlowTab(preferredTabId);
     if (!tab?.id) throw new Error("flow_tab_not_found");
+
+    const config = overlapController.getConfig();
+    if (config.enabled && config.maxConcurrentTasks > 1) {
+      console.info("[AutoFlow][Overlap] True Parallel submit loop active.");
+      startOverlapTimer(tab.id);
+      pumpOverlapQueue(tab.id);
+
+      while (isActiveRun()) {
+        const pending = scheduler.nextPendingTasks(1);
+        const active = overlapController.getActiveTasks();
+
+        if (!pending.length && !active.length && !activeSubmitRuns.size && !activeWatchRuns.size) {
+          console.info("[AutoFlow][Overlap] No pending or active tasks. Idle exit.");
+          break;
+        }
+
+        pumpOverlapQueue(tab.id);
+        await sleep(1000);
+      }
+
+      stopOverlapTimerIfIdle();
+      return;
+    }
+
     const executor = createExecutorForTab(tab.id);
 
     while (isActiveRun()) {

@@ -1273,7 +1273,7 @@ export function createQueueExecutor({
               failureScope: ""
             });
             await notifyTaskStateChange(taskId, "video_partial_submit_observed");
-            if (options.submitOnlyVideos === true) {
+            if (options.submitOnlyVideos === true || options.submitOnly === true) {
               return ledger.getTask(taskId);
             }
             return pollVideoUntilTerminal(taskId, partialVideoMediaIds, task.projectId);
@@ -1378,7 +1378,7 @@ export function createQueueExecutor({
           return failedTask;
         }
 
-        if (options.submitOnlyVideos === true) {
+        if (options.submitOnlyVideos === true || options.submitOnly === true) {
           const videoTask = ledger.updateTask(taskId, {
             status: TaskStatus.generating,
             mediaIds,
