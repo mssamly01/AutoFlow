@@ -1194,7 +1194,211 @@ export function createQueueExecutor({
       return this.runTask(task.id);
     },
 
+    async submitTaskOnly(taskId, options = {}) {
+      const task = ledger.getTask(taskId);
+      if (!task) throw new Error(`Unknown task id: ${taskId}`);
+      if (task.status !== TaskStatus.pending) return task;
+
+      scheduler.markSubmitting(taskId);
+      await notifyTaskStateChange(taskId, "submitting");
+      const submittingTask = ledger.getTask(taskId) || task;
+      logger({
+        type: "task_start",
+        taskId,
+        ...taskLogFields(submittingTask)
+      });
+      try {
+        const result = await submit(task);
+        logger({ type: "submitted", taskId, result });
+        if (!result.ok && isModelAccessDenied(result) && canFallbackVideoModel(task)) {
+          const preparedTask = ledger.getTask(taskId) || submittingTask || task;
+          const fallbackModel = fallbackVideoModelForTask(preparedTask);
+          const fallbackTask = { ...preparedTask, model: fallbackModel };
+          logger({
+            type: "model_fallback",
+            taskId,
+            fromModel: task.model || "",
+            toModel: fallbackModel,
+            reason: resultErrorText(result)
+          });
+          ledger.updateTask(taskId, {
+            model: fallbackModel,
+            modelFallbackFrom: task.model || "",
+            lastError: "",
+            failureClass: "",
+            healAction: "",
+            failureScope: ""
+          });
+          Object.assign(result, result.repairedFromDom
+            ? {
+                ...(await submitViaApi(fallbackTask)),
+                repairedFromDom: true,
+                domError: result.domError || ""
+              }
+            : await submit(fallbackTask));
+          logger({ type: "submitted", taskId, result, modelFallback: true });
+        }
+        if (!result.ok) {
+          const partialVideoMediaIds = VIDEO_MODES.has(task.mode) ? compactIds(result.mediaIds || []) : [];
+          const expectedVideoCount = Math.max(1, Number(task.repeatCount || task.expectedVideos || partialVideoMediaIds.length || 1) || 1);
+          const partialVideoSubmitError = resultErrorText(result);
+          const canAdoptPartialVideoSubmit = partialVideoMediaIds.length > 0
+            && partialVideoMediaIds.length < expectedVideoCount
+            && expectedVideoCount > 1
+            && /DOM_DEBUGGER_FRONTEND_NOT_UPDATED|DOM_DEBUGGER_INCOMPLETE_MEDIA_IDS/i.test(partialVideoSubmitError);
+          if (canAdoptPartialVideoSubmit) {
+            logger({
+              type: "partial_video_submit_adopted_for_repair",
+              taskId,
+              reason: partialVideoSubmitError,
+              mediaIds: partialVideoMediaIds,
+              foundVideos: partialVideoMediaIds.length,
+              expectedVideos: expectedVideoCount
+            });
+            scheduler.markSubmitted(taskId, partialVideoMediaIds, {
+              submitOutputRows: Array.isArray(result.outputRows || result.data?.outputRows)
+                ? (result.outputRows || result.data?.outputRows)
+                : []
+            });
+            const partialTask = ledger.updateTask(taskId, {
+              status: TaskStatus.generating,
+              mediaIds: partialVideoMediaIds,
+              expectedVideos: expectedVideoCount,
+              foundVideos: partialVideoMediaIds.length,
+              partialSubmitRecovered: true,
+              submitObservationRecovered: true,
+              submitObservationError: partialVideoSubmitError,
+              lastError: "",
+              failureClass: "",
+              healAction: "",
+              failureScope: ""
+            });
+            await notifyTaskStateChange(taskId, "video_partial_submit_observed");
+            return partialTask;
+          }
+          if (submitPathFor(task) === "dom_first" && domTaskAllowsApiRepair(task, result)) {
+            logger({
+              type: "dom_api_repair",
+              taskId: task.id,
+              mode: task.mode,
+              reason: result.error || result.data?.error || result.statusText || "DOM_SUBMIT_FAILED",
+              stage: "submitTaskOnly"
+            });
+            const repaired = await submitViaApi(await prepareApiRepairMedia(task, result));
+            logger({ type: "submitted", taskId, result: repaired });
+            if (repaired.ok) {
+              result.mediaIds = repaired.mediaIds || [];
+              result.ok = true;
+              result.status = repaired.status || 200;
+              result.data = repaired.data || {};
+            } else {
+              const failedTask = scheduler.markFailure(taskId, repaired.data?.error || repaired.statusText || `HTTP_${repaired.status}`);
+              await notifyTaskStateChange(taskId, "api_repair_failed");
+              return failedTask;
+            }
+          }
+        }
+        if (!result.ok) {
+          const observedTask = options.allowStatusFeedSubmitObservation === true ? (ledger.getTask(taskId) || {}) : {};
+          const observedVideoIds = observedVideoIdsForTask(observedTask);
+          if (observedVideoIds.length) {
+            logger({
+              type: "submit_failure_adopted_from_status_feed",
+              taskId,
+              reason: result.data?.error || result.statusText || `HTTP_${result.status}`,
+              observedMediaIds: observedVideoIds
+            });
+            const submitOutputRows = Array.isArray(observedTask.submitOutputRows)
+              ? observedTask.submitOutputRows
+              : [];
+            scheduler.markSubmitted(taskId, observedVideoIds, { submitOutputRows });
+            const videoTask = ledger.updateTask(taskId, {
+              status: TaskStatus.generating,
+              mediaIds: observedVideoIds,
+              submitOutputRows,
+              statusRows: Array.isArray(observedTask.statusRows) ? observedTask.statusRows : [],
+              submittedAt: observedTask.submittedAt || new Date().toISOString(),
+              expectedVideos: Number(task.repeatCount || observedTask.expectedVideos || observedVideoIds.length || 1) || 1,
+              lastError: "",
+              failureClass: "",
+              healAction: "",
+              failureScope: "",
+              submitObservationRecovered: true,
+              submitObservationError: result.data?.error || result.statusText || `HTTP_${result.status}`
+            });
+            await notifyTaskStateChange(taskId, "submit_observed_by_status_feed");
+            return videoTask;
+          }
+          const failedTask = scheduler.markFailure(taskId, result.data?.error || result.statusText || `HTTP_${result.status}`);
+          await notifyTaskStateChange(taskId, "submit_failed");
+          return failedTask;
+        }
+
+        const mediaIds = result.mediaIds || [];
+        const submitOutputRows = Array.isArray(result.outputRows || result.data?.outputRows) ? (result.outputRows || result.data?.outputRows) : [];
+        scheduler.markSubmitted(taskId, mediaIds, { submitOutputRows });
+        await notifyTaskStateChange(taskId, "submitted");
+
+        if (task.mode === FlowTaskMode.textToImage) {
+          const imageTask = ledger.updateTask(taskId, {
+            status: TaskStatus.generating,
+            mediaIds,
+            submittedAt: new Date().toISOString(),
+            expectedImages: Number(task.repeatCount || 1) || 1,
+            lastError: "",
+            failureClass: "",
+            healAction: ""
+          });
+          await notifyTaskStateChange(taskId, "image_generating");
+          return imageTask;
+        }
+
+        if (!mediaIds.length && result.data?.frontSubmitObserved === true && task.mode !== FlowTaskMode.textToImage) {
+          const videoTask = ledger.updateTask(taskId, {
+            status: TaskStatus.generating,
+            mediaIds: [],
+            submitOutputRows,
+            submittedAt: new Date().toISOString(),
+            expectedVideos: Number(task.repeatCount || task.expectedVideos || 1) || 1,
+            lastError: "",
+            failureClass: "",
+            healAction: "",
+            submitObservationRecovered: true,
+            submitObservationError: result.statusText || "DOM_DEBUGGER_FRONT_SUBMIT_OBSERVED"
+          });
+          await notifyTaskStateChange(taskId, "video_front_submit_observed");
+          return videoTask;
+        }
+
+        if (!mediaIds.length) {
+          const failedTask = scheduler.markFailure(taskId, "MISSING_GENERATION_IDS");
+          await notifyTaskStateChange(taskId, "missing_generation_ids");
+          return failedTask;
+        }
+
+        const videoTask = ledger.updateTask(taskId, {
+          status: TaskStatus.generating,
+          mediaIds,
+          submitOutputRows,
+          submittedAt: new Date().toISOString(),
+          expectedVideos: Number(task.repeatCount || mediaIds.length || 1) || 1,
+          lastError: "",
+          failureClass: "",
+          healAction: ""
+        });
+        await notifyTaskStateChange(taskId, "video_generating_submit_only");
+        return videoTask;
+      } catch (error) {
+        const failedTask = scheduler.markFailure(taskId, error);
+        await notifyTaskStateChange(taskId, "exception");
+        return failedTask;
+      }
+    },
+
     async runTask(taskId, options = {}) {
+      if (options.submitOnly === true) {
+        return this.submitTaskOnly(taskId, options);
+      }
       const task = ledger.getTask(taskId);
       if (!task) throw new Error(`Unknown task id: ${taskId}`);
       if (task.status !== TaskStatus.pending) return task;
