@@ -3887,17 +3887,29 @@ function pumpOverlapQueue(tabId) {
     const executor = createExecutorForTab(tabId);
     const runPromise = (async () => {
       try {
-        scheduler.markSubmitting(task.id);
-        await notifyTaskStateChange(task.id, "submitting");
+        // Không markSubmitting ở đây.
+        // executor.runTask() yêu cầu task còn pending và sẽ tự markSubmitting.
 
-        let result = await executor.runTask(task.id, { submitOnly: true });
+        let result = await executor.runTask(task.id, {
+          submitOnly: true,
+          overlap: true
+        });
 
-        if (taskMediaKind(result) === "images" && result?.status !== TaskStatus.generating && result?.status !== TaskStatus.complete) {
-          result = await recoverImageTaskAfterSubmitFailure(result, tabId, "overlap_after_submit");
+        const status = String(result?.status || "").toLowerCase();
+
+        if (status === TaskStatus.failed || status === "failed") {
+          throw new Error(
+            result?.lastError ||
+            result?.failureClass ||
+            result?.healAction ||
+            "OVERLAP_SUBMIT_FAILED"
+          );
         }
 
         logOverlapSubmit("SUBMIT_DONE", task.id, {
-          resultOk: result?.status === TaskStatus.generating || result?.status === TaskStatus.complete
+          resultOk:
+            result?.status === TaskStatus.generating ||
+            result?.status === TaskStatus.complete
         });
 
         if (result?.status === TaskStatus.generating) {
@@ -3906,9 +3918,20 @@ function pumpOverlapQueue(tabId) {
           await sleep(250);
           await autoDownloadCompletedTasks([task.id], "overlap_immediate_complete");
         }
+
         await persistQueueState();
       } catch (error) {
-        logOverlapSubmit("SUBMIT_FAILED", task.id, { error: String(error) });
+        console.error("[AutoFlow][OverlapSubmit] failed", {
+          taskId: task.id,
+          error,
+          message: error?.message,
+          stack: error?.stack
+        });
+
+        logOverlapSubmit("SUBMIT_FAILED", task.id, {
+          error: String(error?.message || error)
+        });
+
         scheduler.markFailure(task.id, error);
         await persistQueueState();
       } finally {
