@@ -14,7 +14,7 @@
 
 import { FLOW_MODES } from "../runtime-config.js";
 import { translate } from "../i18n.js";
-import { splitAutoFlowPromptLine } from "../../core/gallery/animate-prompts.js";
+import { splitAutoFlowPromptLine, matchedReferenceIdsForPrompt } from "../../core/gallery/animate-prompts.js";
 
 // ── DOM helpers ────────────────────────────────────────────
 function el(tag, opts, ...kids) {
@@ -625,13 +625,16 @@ function buildStep2Body(state, dispatch) {
   const activeRefIds = activeReferenceIdsForMode(state);
   const limit = REF_LIMITS[mode] ?? 0;
   const activeCta = state.control?.activeApplyMode || "shared";
+  const isAuto = String(state.control?.activeApplyMode || "").toLowerCase() === "match";
   const refCopy = mode === FLOW_MODES.textToVideo
     ? tr(state, "textToVideoNoRefs")
-    : mode === FLOW_MODES.imageToVideo
-      ? tr(state, "frameToVideoRefsHelp")
-      : mode === FLOW_MODES.ingredientsToVideo
-        ? tr(state, "ingredientsRefsHelp")
-        : tr(state, "createImageRefsHelp");
+    : isAuto
+      ? "Auto-match can select all Library images. Only matching filenames are used per task."
+      : mode === FLOW_MODES.imageToVideo
+        ? tr(state, "frameToVideoRefsHelp")
+        : mode === FLOW_MODES.ingredientsToVideo
+          ? tr(state, "ingredientsRefsHelp")
+          : tr(state, "createImageRefsHelp");
 
   if (mode === FLOW_MODES.textToVideo) {
     return el("div", { class: "afw-step-body" },
@@ -650,7 +653,10 @@ function buildStep2Body(state, dispatch) {
       el("div", { class: "afw-icn" }, icon("collections_bookmark")),
       el("div", { class: "afw-meta" },
         el("span", { class: "afw-name", text: tr(state, "referenceLibrary") }),
-        el("span", { class: "afw-sub", text: tr(state, "refsSavedActive", { saved: savedRefs.length, size: formatBytes(totalSize), active: activeRefIds.length, limit }) }),
+        el("span", { class: "afw-sub", text: isAuto
+          ? `Selected Library images: ${activeRefIds.length}/${refs.length} — auto-match by filename`
+          : tr(state, "refsSavedActive", { saved: savedRefs.length, size: formatBytes(totalSize), active: activeRefIds.length, limit })
+        }),
       ),
     ),
     el("button", { id: "addRefsToLibraryButton", class: "afw-add-btn", attrs: { type: "button" } },
@@ -760,7 +766,7 @@ function referenceLimitForMode(mode = "") {
   return 0;
 }
 
-function referencesPatchForMode(mode = "", ids = [], refs = {}) {
+function referencesPatchForMode(mode = "", ids = [], refs = {}, isAuto = false) {
   const next = emptyReferencePatch(refs);
   const cleanIds = ids.map((id) => String(id || "").trim()).filter(Boolean);
   if (mode === FLOW_MODES.imageToVideo) {
@@ -769,11 +775,11 @@ function referencesPatchForMode(mode = "", ids = [], refs = {}) {
     return next;
   }
   if (mode === FLOW_MODES.ingredientsToVideo) {
-    next.ingredientsRefs = cleanIds.slice(0, 3).join("\n");
+    next.ingredientsRefs = isAuto ? cleanIds.join("\n") : cleanIds.slice(0, 3).join("\n");
     return next;
   }
   if (mode === FLOW_MODES.textToImage) {
-    next.imagePromptRefs = cleanIds.slice(0, 10).join("\n");
+    next.imagePromptRefs = isAuto ? cleanIds.join("\n") : cleanIds.slice(0, 10).join("\n");
   }
   return next;
 }
@@ -783,7 +789,10 @@ function applyModePatch(state = {}, modeKey = "shared") {
   const currentBatch = Array.isArray(control.oneToOneBatchRefIds)
     ? control.oneToOneBatchRefIds.map((id) => String(id || "").trim()).filter(Boolean)
     : [];
-  const ids = activeReferenceIdsForMode(state).slice(0, modeKey === "batch" ? 500 : referenceLimitForMode(control.mode));
+  const isAuto = modeKey === "match";
+  const ids = isAuto
+    ? activeReferenceIdsForMode(state)
+    : activeReferenceIdsForMode(state).slice(0, modeKey === "batch" ? 500 : referenceLimitForMode(control.mode));
   const base = {
     activeApplyMode: modeKey,
     promptRefMap: {}
@@ -810,7 +819,7 @@ function applyModePatch(state = {}, modeKey = "shared") {
     return {
       ...base,
       oneToOneBatchRefIds: [],
-      references: currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references) : control.references,
+      references: currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references, isAuto) : control.references,
       presets: { mapLineRefs: true },
       promptMapOpen: true
     };
@@ -820,8 +829,8 @@ function applyModePatch(state = {}, modeKey = "shared") {
       ...base,
       oneToOneBatchRefIds: [],
       references: control.mode === FLOW_MODES.textToImage
-        ? referencesPatchForMode(control.mode, ids, control.references)
-        : (currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references) : control.references),
+        ? referencesPatchForMode(control.mode, ids, control.references, isAuto)
+        : (currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references, isAuto) : control.references),
       presets: { mapLineRefs: true, imageRepeatCount: 1 },
       promptMapOpen: false
     };
@@ -829,7 +838,7 @@ function applyModePatch(state = {}, modeKey = "shared") {
   return {
     ...base,
     oneToOneBatchRefIds: [],
-    references: currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references) : control.references
+    references: currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references, isAuto) : control.references
   };
 }
 
@@ -896,14 +905,20 @@ function activeReferenceIdsForMode(state) {
   const refs = state.control?.references || {};
   const batch = Array.isArray(state.control?.oneToOneBatchRefIds) ? state.control.oneToOneBatchRefIds : [];
   if (batch.length) return batch.map((id) => String(id || "").trim()).filter(Boolean);
+
+  const isAuto = String(state.control?.activeApplyMode || "").toLowerCase() === "match";
+
   if (state.control?.mode === FLOW_MODES.textToImage) {
-    return [...idsFromValue(refs.imagePromptRefs), ...idsFromValue(refs.styleRefRefs), ...idsFromValue(refs.omniRefRefs)];
+    const list = [...idsFromValue(refs.imagePromptRefs), ...idsFromValue(refs.styleRefRefs), ...idsFromValue(refs.omniRefRefs)];
+    return isAuto ? list : list.slice(0, 10);
   }
   if (state.control?.mode === FLOW_MODES.ingredientsToVideo) {
-    return idsFromValue(refs.ingredientsRefs);
+    const list = idsFromValue(refs.ingredientsRefs);
+    return isAuto ? list : list.slice(0, 3);
   }
   if (state.control?.mode === FLOW_MODES.imageToVideo) {
-    return [...idsFromValue(refs.startFrameRef), ...idsFromValue(refs.endFrameRef)];
+    const list = [...idsFromValue(refs.startFrameRef), ...idsFromValue(refs.endFrameRef)];
+    return isAuto ? list : list.slice(0, 2);
   }
   return [];
 }
@@ -1104,6 +1119,52 @@ function effectiveRefIdsForPrompt(state, prompt, index, totalPrompts) {
     return ["__af_previous_output__"];
   }
   const sourceIds = activeReferenceIdsForMode(state);
+
+  if (String(state.control?.activeApplyMode || "").toLowerCase() === "match") {
+    const mode = state.control?.mode;
+    const split = splitAutoFlowPromptLine(prompt);
+    const matchText = String((mode === FLOW_MODES.textToImage ? split.imagePrompt : split.videoPrompt) || split.prompt || prompt || "").trim();
+
+    const allRefs = allReferenceItems(state);
+    const activeIds = new Set(sourceIds);
+    const activeItems = allRefs.filter((item) => activeIds.has(String(item.id)));
+
+    const enrichedRefs = activeItems.map((item) => {
+      const fileName = item.fileName || item.filename || item.originalFileName || "";
+      const cleanFromFile = fileName ? fileName.replace(/\.[^/.]+$/, "").replace(/[_\-.]/g, " ") : "";
+      const displayName = item.characterName || item.displayName || item.label || item.title || item.name || cleanFromFile || "";
+      const aliases = [...new Set([
+        item.aliases,
+        item.characterName,
+        item.displayName,
+        item.label,
+        item.title,
+        item.name,
+        displayName,
+        cleanFromFile,
+        fileName
+      ].flatMap(v => String(v || "").split(/[\s,;]+/)).map(v => v.trim().toLowerCase()).filter(Boolean))];
+
+      return {
+        ...item,
+        id: String(item.id || ""),
+        displayName,
+        aliases
+      };
+    });
+
+    const limit = Number(state.control?.presets?.autoMatchReferenceLimit || state.control?.autoMatchReferenceLimit || 0) || referenceLimitForMode(mode);
+
+    const matchedIds = matchedReferenceIdsForPrompt(matchText, enrichedRefs, {
+      limit,
+      mode,
+      promptIndex: index,
+      debug: false
+    });
+
+    return matchedIds.slice(0, referenceLimitForMode(mode));
+  }
+
   const map = state.control?.promptRefMap || {};
   const key = promptMapKey(prompt, index);
   if (Object.prototype.hasOwnProperty.call(map, key)) {

@@ -2152,6 +2152,12 @@ async function assignLibraryToActiveMode(scope) {
     state.control.oneToOneBatchRefIds = items.map((item) => item.id).filter(Boolean).slice(0, 500);
     state.control.presets.mapLineRefs = true;
     state.control.promptMapOpen = true;
+  } else if (isAutoMatchMode()) {
+    for (const key of Object.keys(state.control.references || {})) {
+      state.control.references[key] = "";
+    }
+    const role = activeReferenceRoleForMode();
+    state.control.references[role] = items.map((item) => item.id).join("\n");
   } else if (scope === "all" && state.control.mode === FLOW_MODES.imageToVideo) {
     state.control.references.startFrameRef = items[0]?.id || "";
     state.control.references.endFrameRef = items[1]?.id || "";
@@ -2761,6 +2767,12 @@ function idsFromReferenceValue(value) {
   return String(value || "").split(/\s+/).map((id) => id.trim()).filter(Boolean);
 }
 
+function isAutoMatchMode(currentState = state) {
+  const control = currentState?.control || currentState || {};
+  const mode = String(control.activeApplyMode || "").toLowerCase();
+  return mode === "match" || mode === "auto" || mode === "auto-match" || mode === "auto_match" || mode === "automatch";
+}
+
 function referenceLimitForMode(mode = state.control.mode) {
   if (mode === FLOW_MODES.textToImage) return 10;
   if (mode === FLOW_MODES.ingredientsToVideo) return 3;
@@ -2771,14 +2783,26 @@ function referenceLimitForMode(mode = state.control.mode) {
 function activeReferenceIdsForMode(mode = state.control.mode) {
   const batchIds = oneToOneBatchRefIds();
   if (batchIds.length) return batchIds;
-  if (mode === FLOW_MODES.textToImage) {
-    return refIdsForRoles(["imagePromptRefs", "styleRefRefs", "omniRefRefs"]).slice(0, 10);
-  }
-  if (mode === FLOW_MODES.ingredientsToVideo) {
-    return refIdsForRoles(["ingredientsRefs"]).slice(0, 3);
-  }
-  if (mode === FLOW_MODES.imageToVideo) {
-    return refIdsForRoles(["startFrameRef", "endFrameRef"]).slice(0, 2);
+  if (isAutoMatchMode()) {
+    if (mode === FLOW_MODES.textToImage) {
+      return refIdsForRoles(["imagePromptRefs", "styleRefRefs", "omniRefRefs"]);
+    }
+    if (mode === FLOW_MODES.ingredientsToVideo) {
+      return refIdsForRoles(["ingredientsRefs"]);
+    }
+    if (mode === FLOW_MODES.imageToVideo) {
+      return refIdsForRoles(["startFrameRef", "endFrameRef"]);
+    }
+  } else {
+    if (mode === FLOW_MODES.textToImage) {
+      return refIdsForRoles(["imagePromptRefs", "styleRefRefs", "omniRefRefs"]).slice(0, 10);
+    }
+    if (mode === FLOW_MODES.ingredientsToVideo) {
+      return refIdsForRoles(["ingredientsRefs"]).slice(0, 3);
+    }
+    if (mode === FLOW_MODES.imageToVideo) {
+      return refIdsForRoles(["startFrameRef", "endFrameRef"]).slice(0, 2);
+    }
   }
   return [];
 }
@@ -2807,6 +2831,17 @@ function assignReferenceForActiveMode(itemId) {
   }
   state.control.oneToOneBatchRefIds = [];
   state.control.promptRefMap = {};
+
+  if (isAutoMatchMode()) {
+    const role = activeReferenceRoleForMode();
+    const current = idsFromReferenceValue(state.control.references[role]);
+    const next = current.includes(itemId)
+      ? current.filter((id) => id !== itemId)
+      : [...current, itemId];
+    setReferenceIds(role, next);
+    return true;
+  }
+
   if (state.control.mode === FLOW_MODES.imageToVideo) {
     const start = state.control.references.startFrameRef || "";
     const end = state.control.references.endFrameRef || "";
@@ -2871,6 +2906,16 @@ function activateImportedReferences(items = []) {
   state.control.oneToOneBatchRefIds = [];
   state.control.promptRefMap = {};
   if (state.control.mode === FLOW_MODES.textToVideo) return;
+  if (isAutoMatchMode()) {
+    for (const key of Object.keys(state.control.references || {})) {
+      state.control.references[key] = "";
+    }
+    const role = activeReferenceRoleForMode();
+    const current = new Set(idsFromReferenceValue(state.control.references[role]));
+    ids.forEach((id) => current.add(id));
+    setReferenceIds(role, [...current]);
+    return;
+  }
   if (state.control.mode === FLOW_MODES.imageToVideo) {
     state.control.references.startFrameRef = ids[0] || "";
     state.control.references.endFrameRef = ids[1] || "";
@@ -3381,7 +3426,7 @@ function autoMatchReferenceLimit(currentState = state) {
   );
 
   if (Number.isFinite(explicitLimit) && explicitLimit > 0) return explicitLimit;
-  return 10;
+  return referenceLimitForMode(currentState?.control?.mode || currentState?.mode);
 }
 
 function promptReferenceMapKey(promptText = "", index = 0) {
