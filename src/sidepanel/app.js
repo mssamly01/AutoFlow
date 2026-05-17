@@ -9,7 +9,7 @@ import { base64FromDataUrl, getReferenceBlob, putReferenceBlob } from "../core/s
 import { FLOW_MODES, STORAGE_KEY, createDefaultState, mergeState } from "./runtime-config.js";
 import { renderControl, renderGallery, renderHistory, renderLiveQueue, renderLogs, renderScenes, renderSettings } from "./views.js";
 import { createGalleryController } from "./gallery-controller.js";
-import { ensureTaskInlineCharacterRefs, inferFirstCharacterNameFromPrompt } from "../core/gallery/character-ref-matcher.js";
+import { ensureTaskInlineCharacterRefs, inferFirstCharacterNameFromPrompt, normalizeCharacterRefKey } from "../core/gallery/character-ref-matcher.js";
 
 
 const ROUTES = {
@@ -3643,6 +3643,7 @@ function allReferenceItems() {
 function refInputFromItem(item, role = "", mediaId = "", options = {}) {
   const useStoredMediaId = options.useStoredMediaId !== false;
   const hasBlobStore = Boolean(item?.blobStoreId);
+  const characterName = String(item?.characterName || item?.displayName || item?.title || item?.name || "").trim();
   return {
     id: String(item?.id || ""),
     blobStoreId: String(item?.blobStoreId || ""),
@@ -3655,7 +3656,10 @@ function refInputFromItem(item, role = "", mediaId = "", options = {}) {
     uploadedAt: String(item?.uploadedAt || ""),
     imageUrl: String(item?.imageUrl || item?.mediaUrl || ""),
     mediaUrl: String(item?.mediaUrl || ""),
-    dataUrl: String(hasBlobStore ? "" : (item?.dataUrl || item?.imageUrl || ""))
+    dataUrl: String(hasBlobStore ? "" : (item?.dataUrl || item?.imageUrl || "")),
+    characterName,
+    displayName: String(item?.displayName || characterName),
+    aliases: Array.isArray(item?.aliases) ? item.aliases.map((alias) => String(alias || "").trim()).filter(Boolean) : []
   };
 }
 
@@ -3783,13 +3787,152 @@ function effectiveTextToImageModel(model = "nano_banana_pro", refInputs = [], op
   return model || "nano_banana_pro";
 }
 
+function isCharacterRefInput(ref = {}) {
+  const role = String(ref?.role || "").trim();
+  return role === "character_reference";
+}
+
+function usableCharacterNameFromRef(ref = {}) {
+  const raw = String(
+    ref.displayName ||
+    ref.title ||
+    ref.name ||
+    cleanNameFromFileName(ref.fileName || "") ||
+    ref.characterName
+  ).trim();
+  const cleaned = cleanNameFromFileName(raw) || raw;
+  const key = normalizeCharacterRefKey(cleaned);
+  if (!key || ["reference", "ref", "image", "untitled"].includes(key)) return "";
+  return cleaned;
+}
+
+function promoteImplicitSingleCharacterRef(task = {}) {
+  if (task.mode !== FLOW_MODES.textToImage) return task;
+  if (Array.isArray(task.characters) && task.characters.length) return task;
+  const refInputs = Array.isArray(task.refInputs) ? task.refInputs : [];
+  if (refInputs.length !== 1 || refInputs.some(isCharacterRefInput)) return task;
+  const characterName = usableCharacterNameFromRef(refInputs[0]);
+  if (!characterName) return task;
+  return {
+    ...task,
+    characterName,
+    characters: [characterName],
+    refInputs: [{
+      ...refInputs[0],
+      characterName,
+      role: "character_reference"
+    }]
+  };
+}
+
+function findReferenceItemForRef(ref = {}, allRefs = []) {
+  const candidates = Array.isArray(allRefs) ? allRefs : [];
+  const ids = new Set([ref.id, ref.blobStoreId, ref.mediaId, ref.assetImageId]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean));
+  const fileKey = normalizeCharacterRefKey(ref.fileName || ref.name || ref.title || "");
+  return candidates.find((item) => {
+    const itemIds = [item.id, item.blobStoreId, item.mediaId, item.assetImageId]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+    if (itemIds.some((id) => ids.has(id))) return true;
+    return Boolean(fileKey && normalizeCharacterRefKey(item.fileName || item.name || item.title || "") === fileKey);
+  }) || null;
+}
+
+function stablePositiveSeed(value = "") {
+  let hash = 2166136261;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (Math.abs(hash) % 2147483646) + 1;
+}
+
+function characterIdentityForTask(task = {}) {
+  const refs = (Array.isArray(task.refInputs) ? task.refInputs : []).filter(isCharacterRefInput);
+  if (!refs.length) return null;
+  const names = uniqueStrings([
+    task.characterName,
+    task.characters,
+    refs.map((ref) => ref.characterName)
+  ]);
+  const refKeys = refs
+    .map((ref) => [
+      normalizeCharacterRefKey(ref.characterName || ref.displayName || ref.fileName || ref.title || ""),
+      ref.mediaId || ref.assetImageId || ref.blobStoreId || ref.id || ref.fileName || ""
+    ].map((value) => String(value || "").trim()).filter(Boolean).join(":"))
+    .filter(Boolean)
+    .sort();
+  if (!refKeys.length) return null;
+  const identityKey = refKeys.join("|");
+  const readableNames = names.length ? names : refs.map((ref) => ref.characterName || ref.displayName || ref.fileName).filter(Boolean);
+  return {
+    identityKey,
+    names: uniqueStrings(readableNames),
+    seed: stablePositiveSeed(identityKey)
+  };
+}
+
+function characterConsistencyInstruction(identity = null) {
+  if (!identity?.names?.length) return "";
+  const names = identity.names.join(", ");
+  return `Character consistency: use the attached character reference image(s) as the exact same recurring character(s): ${names}. Preserve facial identity, hairstyle, body proportions, outfit cues, and distinctive markings across every queued image; change only the pose, action, camera, lighting, and scene requested by this prompt.`;
+}
+
+async function prepareApiCharacterConsistency(task = {}, allRefs = []) {
+  let refInputs = Array.isArray(task.refInputs) ? task.refInputs.map((ref) => ({ ...ref })) : [];
+  const characterRefs = refInputs.filter(isCharacterRefInput);
+  if (!characterRefs.length) return task;
+
+  const uploadTargets = [];
+  for (const ref of characterRefs) {
+    if (ref.mediaId) continue;
+    const source = findReferenceItemForRef(ref, allRefs) || ref;
+    if (!source.mediaId) uploadTargets.push(source);
+  }
+  if (uploadTargets.length) {
+    await ensureMediaIds(uploadTargets);
+  }
+
+  refInputs = refInputs.map((ref) => {
+    if (!isCharacterRefInput(ref) || ref.mediaId) return ref;
+    const source = findReferenceItemForRef(ref, allRefs) || ref;
+    return {
+      ...ref,
+      mediaId: String(source.mediaId || ref.mediaId || ""),
+      assetImageId: String(source.assetImageId || ref.assetImageId || "")
+    };
+  });
+
+  const nextTask = {
+    ...task,
+    refInputs,
+    refMediaIds: uniqueStrings([
+      task.refMediaIds,
+      refInputs.map((ref) => ref.mediaId)
+    ])
+  };
+  const identity = characterIdentityForTask(nextTask);
+  if (!identity) return nextTask;
+  return {
+    ...nextTask,
+    characterName: nextTask.characterName || identity.names[0] || "",
+    characters: identity.names,
+    characterIdentityKey: identity.identityKey,
+    characterSeed: identity.seed,
+    characterConsistencyPrompt: characterConsistencyInstruction(identity)
+  };
+}
+
 /**
  * Enriches a task with character reference inputs by matching character names in the prompt.
  */
 async function enrichTaskWithCharacterRefs(task) {
   try {
     const allRefs = typeof allReferenceItems === "function" ? allReferenceItems() : [];
-    const enriched = ensureTaskInlineCharacterRefs(task, allRefs);
+    const enriched = promoteImplicitSingleCharacterRef(ensureTaskInlineCharacterRefs(task, allRefs));
     
     if (!enriched?.refInputs?.length) return task;
 
@@ -3812,7 +3955,7 @@ async function enrichTaskWithCharacterRefs(task) {
       enriched.refInputs = finalRefs;
     }
 
-    return enriched;
+    return domFirst ? enriched : await prepareApiCharacterConsistency(enriched, allRefs);
   } catch (error) {
     console.error("enrichTaskWithCharacterRefs failed", error);
     return task;

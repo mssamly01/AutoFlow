@@ -276,6 +276,17 @@ export function createQueueExecutor({
     };
   }
 
+  function stableSeedFactory(baseSeed = 0) {
+    const base = Math.max(1, Math.min(2147483646, Number(baseSeed || 0) || 0));
+    if (!base) return undefined;
+    let offset = 0;
+    return () => {
+      const next = ((base + offset) % 2147483646) || 1;
+      offset += 1;
+      return next;
+    };
+  }
+
   function freshBatchId() {
     try {
       if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
@@ -322,7 +333,12 @@ export function createQueueExecutor({
       return flowClient.submitTextToImage({
         ...common,
         model: task.model || "nano_banana_pro",
-        mediaIds: inputMediaIds
+        mediaIds: inputMediaIds,
+        refInputs: Array.isArray(task.refInputs) ? task.refInputs : [],
+        characterName: task.characterName || "",
+        characters: Array.isArray(task.characters) ? task.characters : [],
+        characterConsistencyPrompt: task.characterConsistencyPrompt || "",
+        seedFactory: stableSeedFactory(task.characterSeed)
       });
     }
 

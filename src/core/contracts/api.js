@@ -190,11 +190,47 @@ export function buildClientContext({
   return context;
 }
 
+function compactString(value = "") {
+  return String(value || "").trim();
+}
+
+function uniqueStrings(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [values])
+    .flatMap((value) => Array.isArray(value) ? value : [value])
+    .map(compactString)
+    .filter(Boolean))];
+}
+
+function characterNamesFromImageRefs(refInputs = [], fallbackNames = []) {
+  const refs = Array.isArray(refInputs) ? refInputs : [];
+  const names = refs
+    .filter((ref) => compactString(ref?.role) === "character_reference")
+    .map((ref) => compactString(ref.characterName || ref.displayName || ref.fileName || ref.name || ref.title));
+  return uniqueStrings([...fallbackNames, ...names]);
+}
+
+function promptWithCharacterConsistency(prompt = "", options = {}) {
+  const text = compactString(prompt);
+  const names = characterNamesFromImageRefs(options.refInputs, [
+    options.characterName,
+    options.characters
+  ]);
+  const explicit = compactString(options.characterConsistencyPrompt);
+  if (!explicit && !names.length) return text;
+  if (/character consistency\s*:/i.test(text)) return text;
+  const instruction = explicit || `Character consistency: use the attached character reference image(s) as the same recurring character(s): ${names.join(", ")}. Preserve identity, face, hairstyle, body proportions, outfit cues, and distinctive markings; change only the pose, action, camera, lighting, and scene requested by this prompt.`;
+  return [instruction, text].filter(Boolean).join("\n\n");
+}
+
 export function buildTextToImageBody({
   prompt,
   projectId,
   recaptchaToken,
   mediaIds = [],
+  refInputs = [],
+  characterName = "",
+  characters = [],
+  characterConsistencyPrompt = "",
   repeatCount = 1,
   model = "nano_banana_pro",
   aspectRatio = "landscape",
@@ -208,6 +244,12 @@ export function buildTextToImageBody({
     includePaygateTier: false
   });
   const requestCount = Math.max(1, Math.min(8, Number.parseInt(repeatCount, 10) || 1));
+  const effectivePrompt = promptWithCharacterConsistency(prompt, {
+    refInputs,
+    characterName,
+    characters,
+    characterConsistencyPrompt
+  });
   return {
     clientContext,
     mediaGenerationContext: { batchId },
@@ -216,7 +258,7 @@ export function buildTextToImageBody({
       clientContext: { ...clientContext, recaptchaContext: clientContext.recaptchaContext ? { ...clientContext.recaptchaContext } : undefined },
       imageModelName: normalizeImageModelName(model, refs.length > 0),
       imageAspectRatio: normalizeImageAspectRatio(aspectRatio),
-      structuredPrompt: { parts: [{ text: String(prompt || "").trim() }] },
+      structuredPrompt: { parts: [{ text: effectivePrompt }] },
       seed: seedFactory(),
       imageInputs: refs.map((name) => ({
         imageInputType: "IMAGE_INPUT_TYPE_REFERENCE",

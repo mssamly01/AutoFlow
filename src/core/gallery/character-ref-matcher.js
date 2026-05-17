@@ -95,7 +95,16 @@ export function getTaskCharacterNames(task = {}) {
 export function refInputMatchesCharacter(ref = {}, characterName = "") {
   const refKey = normalizeCharacterRefKey(getRefInputFileName(ref));
   const charKey = normalizeCharacterRefKey(characterName);
-  return Boolean(refKey && charKey && refKey === charKey);
+  return Boolean(
+    refKey &&
+    charKey &&
+    (
+      refKey === charKey ||
+      refKey.startsWith(`${charKey} `) ||
+      refKey.endsWith(` ${charKey}`) ||
+      refKey.includes(` ${charKey} `)
+    )
+  );
 }
 
 /**
@@ -135,22 +144,24 @@ export function ensureTaskInlineCharacterRefs(task = {}, allRefInputs = []) {
 
   const existingRefs = normalizeTaskRefInputs(task);
 
-  // If we already have refs, ensure they have characterName metadata
+  // If we already have refs, preserve non-character refs and tag only the
+  // refs that can be tied to a character by metadata, filename, or sole-ref use.
   if (existingRefs.length) {
     return {
       ...task,
       characters,
       characterName: task.characterName || characters[0],
       refInputs: existingRefs.map((ref) => {
+        const explicitCharacter = String(ref.characterName || ref.character || "").trim().normalize("NFC");
         const matchedCharacter =
-          ref.characterName ||
+          characters.find((name) => explicitCharacter && normalizeCharacterRefKey(name) === normalizeCharacterRefKey(explicitCharacter)) ||
           characters.find((name) => refInputMatchesCharacter(ref, name)) ||
-          characters[0];
+          (existingRefs.length === 1 && characters.length === 1 ? characters[0] : "");
 
         return {
           ...ref,
-          characterName: matchedCharacter,
-          role: ref.role || "character_reference"
+          characterName: matchedCharacter || explicitCharacter || ref.characterName || "",
+          role: matchedCharacter ? "character_reference" : (ref.role || "")
         };
       })
     };

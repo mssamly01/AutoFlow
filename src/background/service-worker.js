@@ -3687,6 +3687,9 @@ function normalizeRefInput(ref = {}) {
     mediaId,
     fileName,
     title: compactString(ref.title || fileName),
+    characterName: compactString(ref.characterName || ref.displayName),
+    displayName: compactString(ref.displayName || ref.characterName),
+    aliases: Array.isArray(ref.aliases) ? ref.aliases.map(compactString).filter(Boolean) : [],
     mimeType: compactString(ref.mimeType || "image/png"),
     imageUrl: compactString(ref.imageUrl || ref.dataUrl || ref.mediaUrl),
     dataUrl: compactString(ref.dataUrl),
@@ -4937,7 +4940,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const jobPromptCount = Number(job?.jobPromptCount || fallbackJobPromptCount || jobs.length || 1);
         const jobTitle = compactString(job?.jobTitle) || fallbackJobTitle;
         const refInputs = refInputsFrom(job?.refInputs || message.payload?.refInputs);
-        const inputMediaIds = mediaIdsFrom(job?.mediaIds || message.payload?.mediaIds || refInputs.map((ref) => ref.mediaId));
+        const jobMediaIds = mediaIdsFrom(job?.mediaIds);
+        const payloadMediaIds = mediaIdsFrom(message.payload?.mediaIds);
+        const refInputMediaIds = mediaIdsFrom(refInputs.map((ref) => ref.mediaId));
+        const inputMediaIds = jobMediaIds.length ? jobMediaIds : (payloadMediaIds.length ? payloadMediaIds : refInputMediaIds);
         const startRefInput = normalizeRefInput(job?.startRefInput)
           || refInputs.find((ref) => ref.role === "startFrameRef")
           || null;
@@ -4964,6 +4970,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           imagePrompt: compactString(job?.imagePrompt),
           videoPrompt: compactString(job?.videoPrompt),
           sceneTag: compactString(job?.sceneTag),
+          characterName: compactString(job?.characterName),
+          characters: Array.isArray(job?.characters) ? job.characters.map(compactString).filter(Boolean) : [],
+          characterIdentityKey: compactString(job?.characterIdentityKey),
+          characterSeed: Number.isFinite(Number(job?.characterSeed)) ? Number(job.characterSeed) : null,
+          characterConsistencyPrompt: compactString(job?.characterConsistencyPrompt),
           projectId: compactString(job?.projectId) || compactString(message.payload?.projectId),
           model: compactString(job?.model) || compactString(message.payload?.model) || "default",
           aspectRatio: compactString(job?.aspectRatio) || compactString(message.payload?.aspectRatio) || "landscape",
