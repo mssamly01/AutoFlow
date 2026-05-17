@@ -2,8 +2,9 @@
 // Manages concurrency gating: decides when the next task can start
 // based on a time-based delay (overlapDelaySeconds).
 //
-// Submit remains serialized (via mutex in service-worker).
-// Only generation/polling is overlapped.
+// API submits can run in parallel up to the configured slot count.
+// DOM submits share one composer/debugger path, so only the DOM submit action is
+// serialized while generation/polling still overlaps for DOM and API tasks.
 
 import { TaskStatus } from "./task-ledger.js";
 
@@ -24,7 +25,7 @@ export function normalizeOverlapConfig(presets = {}) {
   return {
     enabled,
     maxConcurrentTasks: enabled
-      ? clampNumber(presets?.overlapMaxConcurrentTasks, 1, 4, 1)
+      ? clampNumber(presets?.overlapMaxConcurrentTasks, 1, 4, 2)
       : 1,
     delaySeconds: clampNumber(presets?.overlapDelaySeconds, 5, 600, 30)
   };

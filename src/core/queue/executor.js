@@ -942,22 +942,25 @@ export function createQueueExecutor({
     return repaired;
   }
 
-  async function runSubmitExclusive(fn) {
+  async function runDomSubmitExclusive(fn) {
     if (submitLock && typeof submitLock.runExclusive === "function") {
       return submitLock.runExclusive(fn);
     }
     return fn();
   }
 
+  async function submitViaDomExclusive(task, meta = {}) {
+    return runDomSubmitExclusive(() => submitViaDom(task, meta));
+  }
+
   async function submit(task) {
-    return runSubmitExclusive(async () => {
     task = await prepareReferenceMediaForSubmit(task);
     const submitPath = submitPathFor(task);
     const domVideoObservationMeta = {};
     if (submitPath === "dom_first") {
       let domResult;
       try {
-        domResult = await submitViaDom(task, domVideoObservationMeta);
+        domResult = await submitViaDomExclusive(task, domVideoObservationMeta);
       } catch (error) {
         domResult = {
           ok: false,
@@ -1011,7 +1014,7 @@ export function createQueueExecutor({
           error: resultErrorText(apiResult),
           ...taskLogFields(task)
         });
-        return submitViaDom(task, { ...domVideoObservationMeta, apiResult, apiSessionHeatFallback: true });
+        return submitViaDomExclusive(task, { ...domVideoObservationMeta, apiResult, apiSessionHeatFallback: true });
       }
       return apiResult;
     }
@@ -1024,8 +1027,7 @@ export function createQueueExecutor({
       status: apiResult.status || 0,
       statusText: apiResult.statusText || ""
     });
-    return submitViaDom(task, { ...domVideoObservationMeta, apiResult });
-    }); // end runSubmitExclusive
+    return submitViaDomExclusive(task, { ...domVideoObservationMeta, apiResult });
   }
 
   async function pollVideoUntilTerminal(taskId, mediaIds, projectId) {

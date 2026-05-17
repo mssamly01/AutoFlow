@@ -1,6 +1,6 @@
-// Simple async mutex for serializing submit operations.
-// Ensures only one task submits via API/DOM at a time,
-// even when multiple tasks are overlapping generation.
+// Simple async mutex for serializing shared UI submit operations.
+// API submits can run in parallel; DOM submits use this because they share one
+// Flow composer/debugger path even when generation is overlapping.
 
 export function createAsyncMutex() {
   let chain = Promise.resolve();

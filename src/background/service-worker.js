@@ -3853,6 +3853,29 @@ function stopOverlapTimerIfIdle() {
   overlapTimerId = null;
 }
 
+function hasActiveDomSubmitRun() {
+  for (const taskId of activeSubmitRuns.keys()) {
+    const task = ledger.getTask(taskId);
+    if (taskPrefersDom(task)) return true;
+  }
+  return false;
+}
+
+function filterOverlapTasksForSubmitSlots(tasks = [], freeSlots = 0) {
+  const out = [];
+  let domSubmitSlotUsed = hasActiveDomSubmitRun();
+  for (const task of tasks) {
+    if (!task?.id) continue;
+    if (taskPrefersDom(task)) {
+      if (domSubmitSlotUsed) continue;
+      domSubmitSlotUsed = true;
+    }
+    out.push(task);
+    if (out.length >= freeSlots) break;
+  }
+  return out;
+}
+
 function pumpOverlapQueue(tabId) {
   if (!runtimeState.queueRunning) {
     stopOverlapTimerIfIdle();
@@ -3877,7 +3900,8 @@ function pumpOverlapQueue(tabId) {
   const tasks = overlapController.pickNextTasksToStart();
   if (!tasks.length) return;
 
-  const tasksToStart = tasks.slice(0, freeSlots);
+  const tasksToStart = filterOverlapTasksForSubmitSlots(tasks, freeSlots);
+  if (!tasksToStart.length) return;
 
   for (const task of tasksToStart) {
     if (activeSubmitRuns.has(task.id) || activeWatchRuns.has(task.id)) continue;
@@ -3962,7 +3986,7 @@ async function runQueueUntilIdle(preferredTabId) {
 
     const config = overlapController.getConfig();
     if (config.enabled && config.maxConcurrentTasks > 1) {
-      console.info("[AutoFlow][Overlap] True Parallel submit loop active.");
+      console.info("[AutoFlow][Overlap] Overlap submit loop active.");
       startOverlapTimer(tab.id);
       pumpOverlapQueue(tab.id);
 

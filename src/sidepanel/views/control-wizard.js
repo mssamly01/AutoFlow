@@ -1061,8 +1061,8 @@ function buildStep3Body(state, prompts, refs, mode) {
       ? row(
           "speed",
           "Overlap",
-          "ON · Tasks start before previous completes",
-          valSelect("overlapMaxConcurrentTasks", String(presets.overlapMaxConcurrentTasks || 1), overlapOptions)
+          "ON - DOM/API tasks start before previous completes",
+          valSelect("overlapMaxConcurrentTasks", String(presets.overlapMaxConcurrentTasks || 2), overlapOptions)
         )
       : null,
     // T2I autopilot: animate generated images via Frame-to-Video after the

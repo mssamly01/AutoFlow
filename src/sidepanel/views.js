@@ -1027,7 +1027,7 @@ export function renderSettings(root, state) {
 
     subheader("speed", "Overlap Queue"),
     field("Enable overlap:", controlGroup(checkInput("overlapEnabledCheckbox", presets.overlapEnabled, "overlapEnabled"))),
-    el("div", { class: "hint-text wide", text: "Start the next task before the current task fully completes. Submit remains serialized for safety." }),
+    el("div", { class: "hint-text wide", text: "Start the next task before the current task fully completes. API can submit in parallel; DOM uses one protected composer slot." }),
     field("Max concurrent tasks:", controlGroup(numberInput("overlapMaxConcurrentTasks", presets.overlapMaxConcurrentTasks, "overlapMaxConcurrentTasks", { min: "1", max: "4" }))),
     field("Overlap delay (seconds):", controlGroup(numberInput("overlapDelaySeconds", presets.overlapDelaySeconds, "overlapDelaySeconds", { min: "5", max: "600" }))),
 
@@ -1984,7 +1984,7 @@ function liveQueueEffectiveStatus(item = {}, options = {}) {
   const expectedDownloads = outputLedger.expectedDownloadCount || Math.max(0, expectedCount - failedOutputCount);
   const retryStatus = String(item.retryStatus || "").toLowerCase();
   const failedDownloadCount = outputLedger.hasDownloadErrors ? 1 : 0;
-  if (status === "pending" && options.queueRunning === true) return "starting";
+  if (status === "pending" && options.queueRunning === true) return "waiting";
   if ((status === "complete" || status === "done") && shouldAutoDownload && (failedDownloadCount > 0 || outputLedger.downloadErrorIds.length > 0)) return "download_failed";
   if ((status === "complete" || status === "done") && resultCount < expectedCount) {
     if (retryStatus === "queued" || retryStatus === "repairing" || retryStatus === "retrying") return "retrying";

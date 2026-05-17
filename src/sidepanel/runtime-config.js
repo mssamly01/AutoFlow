@@ -26,7 +26,7 @@ export const FLOW_MODES = Object.freeze({
 
 export function createDefaultState(now = new Date().toISOString()) {
   return {
-    version: 4,
+    version: 5,
     seededAt: now,
     ui: {
       activeRoute: "control",
@@ -128,7 +128,7 @@ export function createDefaultState(now = new Date().toISOString()) {
 
         // Overlap Queue
         overlapEnabled: true,
-        overlapMaxConcurrentTasks: 1,
+        overlapMaxConcurrentTasks: 2,
         overlapDelaySeconds: 20
       }
     },
@@ -328,7 +328,10 @@ function normalizePresets(presets = {}, sourceVersion = 0) {
   out.autoStartNextJob = Boolean(out.autoStartNextJob);
   out.autoRetryFailedUntilZero = Boolean(out.autoRetryFailedUntilZero);
   out.overlapEnabled = out.overlapEnabled !== false;
-  out.overlapMaxConcurrentTasks = clampInt(out.overlapMaxConcurrentTasks, 1, 4, 1);
+  if (sourceVersion < 5 && out.overlapEnabled && Number(out.overlapMaxConcurrentTasks || 1) <= 1) {
+    out.overlapMaxConcurrentTasks = 2;
+  }
+  out.overlapMaxConcurrentTasks = clampInt(out.overlapMaxConcurrentTasks, 1, 4, 2);
   out.overlapDelaySeconds = clampInt(out.overlapDelaySeconds, 5, 600, 20);
   return out;
 }
