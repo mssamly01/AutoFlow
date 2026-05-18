@@ -119,6 +119,9 @@ export function sanitizeTaskForDebugReport(task = {}) {
     generatedMediaIds: generatedMediaIdsFromTask(task),
     mediaIds: compactIdList(task.mediaIds || []),
     refMediaIds: compactIdList(task.refMediaIds || []),
+    autoMatchReferenceMentions: Array.isArray(task.autoMatchReferenceMentions)
+      ? task.autoMatchReferenceMentions.map((mention) => sanitizeEventValue(mention))
+      : [],
     downloadedMediaIds: compactIdList(task.downloadedMediaIds || []),
     skippedDownloadMediaIds: compactIdList(task.skippedDownloadMediaIds || []),
     downloadErrorMediaIds: compactIdList(task.downloadErrorMediaIds || []),

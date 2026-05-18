@@ -140,7 +140,10 @@ export function splitAutoFlowPromptLine(line = "") {
 function normalizeAutoMatchFileNameText(value = "") {
   return String(value || "")
     .normalize("NFKD")
+    .replace(/\u0110/g, "D")
+    .replace(/\u0111/g, "d")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/['’`´]/g, "")
     .replace(/\.[a-z0-9]{2,8}$/i, "")
     .replace(/^run\s*[-_ ]*/i, "")
     .replace(/^ref\s*[-_ ]*/i, "")
@@ -156,7 +159,10 @@ function normalizeAutoMatchFileNameText(value = "") {
 function normalizeAutoMatchPromptText(value = "") {
   return String(value || "")
     .normalize("NFKD")
+    .replace(/\u0110/g, "D")
+    .replace(/\u0111/g, "d")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/['’`´]/g, "")
     .replace(/[_\-\.]+/g, " ")
     .replace(/[^\p{L}\p{N}\s]+/gu, " ")
     .replace(/\s+/g, " ")
@@ -177,6 +183,49 @@ function autoMatchImageBaseName(item = {}) {
   return normalizeAutoMatchFileNameText(rawName);
 }
 
+function autoMatchActualFileName(item = {}) {
+  return String(
+    item.fileName ||
+    item.filename ||
+    item.originalFileName ||
+    item.sourceFileName ||
+    item.localFileName ||
+    item.uploadName ||
+    ""
+  ).trim();
+}
+
+function uniqueAutoMatchStrings(values = []) {
+  return [...new Set(
+    values
+      .flatMap((value) => Array.isArray(value) ? value : [value])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  )];
+}
+
+function autoMatchCandidateNameEntries(item = {}) {
+  const fileName = autoMatchActualFileName(item);
+  const fileBase = fileName.replace(/\.[a-z0-9]{2,8}$/i, "");
+  const rawNames = uniqueAutoMatchStrings([
+    fileName,
+    fileBase,
+    item.title,
+    item.displayName,
+    item.characterName,
+    item.label,
+    item.name,
+    item.aliases
+  ]);
+
+  return rawNames
+    .map((raw) => ({
+      raw,
+      normalized: normalizeAutoMatchFileNameText(raw)
+    }))
+    .filter((entry) => entry.normalized.length >= 3 && !REFERENCE_MATCH_STOPWORDS.has(entry.normalized));
+}
+
 function promptContainsAutoMatchName(promptText = "", imageName = "") {
   const prompt = normalizeAutoMatchPromptText(promptText);
   const name = normalizeAutoMatchFileNameText(imageName);
@@ -185,6 +234,22 @@ function promptContainsAutoMatchName(promptText = "", imageName = "") {
   if (name.length < 3) return false;
 
   return ` ${prompt} `.includes(` ${name} `);
+}
+
+function normalizedPromptContainsPhrase(promptText = "", phrase = "") {
+  const prompt = ` ${normalizeAutoMatchPromptText(promptText)} `;
+  const normalized = normalizeAutoMatchPromptText(phrase);
+  return Boolean(prompt.trim() && normalized && prompt.includes(` ${normalized} `));
+}
+
+function phraseContainmentScore(left = "", right = "") {
+  const a = normalizeAutoMatchPromptText(left);
+  const b = normalizeAutoMatchPromptText(right);
+  if (!a || !b) return 0;
+  if (a === b) return 120;
+  if (` ${a} `.includes(` ${b} `)) return 80;
+  if (` ${b} `.includes(` ${a} `)) return 70;
+  return 0;
 }
 
 function escapedRegex(value = "") {
@@ -282,6 +347,63 @@ function autoMatchRoleForReference(promptText = "", imageName = "", firstIndex =
   };
 }
 
+function roleInfoForNameAndDescription(name = "", description = "") {
+  const text = normalizeForRoleDetection(`${name} ${description}`);
+  const characterHints = /\b(gender|female|male|age|height|face|hair|eyes|posture|outfit|body|skin|expression)\b/i;
+  const locationHints = /\b(location|house|home|room|interior|exterior|background|street|city|kitchen|bedroom|office|garden|school|shop|cafe)\b/i;
+
+  if (characterHints.test(text)) {
+    return { role: "character", rolePriority: 0 };
+  }
+  if (locationHints.test(text)) {
+    return { role: "location", rolePriority: 1 };
+  }
+  return { role: "other", rolePriority: 2 };
+}
+
+function cleanEntityHeadingName(value = "") {
+  return String(value || "")
+    .replace(/^(character|location|place|setting|background)\s*:\s*/i, "")
+    .replace(/^[\s"'“”‘’\-–—:]+|[\s"'“”‘’\-–—:]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function autoMatchEntityMentionsFromPrompt(prompt = "") {
+  const text = String(prompt || "");
+  const mentions = [];
+  const headingPattern = /(^|[\n\r.;!?])(\s*)([^\n\r()]{2,120}?)\s*(?=\()/gu;
+
+  for (const match of text.matchAll(headingPattern)) {
+    const prefix = match[1] || "";
+    const spacing = match[2] || "";
+    const rawHeading = match[3] || "";
+    const leadingTrimmed = rawHeading.match(/^\s*/)?.[0]?.length || 0;
+    const trailingTrimmed = rawHeading.match(/\s*$/)?.[0]?.length || 0;
+    const rawStart = match.index + prefix.length + spacing.length + leadingTrimmed;
+    const rawEnd = match.index + prefix.length + spacing.length + rawHeading.length - trailingTrimmed;
+    const entityName = cleanEntityHeadingName(rawHeading);
+    const normalized = normalizeAutoMatchPromptText(entityName);
+    if (normalized.length < 3) continue;
+    if (REFERENCE_MATCH_STOPWORDS.has(normalized)) continue;
+
+    const descriptionStart = rawEnd;
+    const descriptionEnd = Math.min(text.length, descriptionStart + 220);
+    const roleInfo = roleInfoForNameAndDescription(entityName, text.slice(descriptionStart, descriptionEnd));
+    mentions.push({
+      source: "heading",
+      entityName,
+      normalized,
+      start: rawStart,
+      end: rawEnd,
+      role: roleInfo.role,
+      rolePriority: roleInfo.rolePriority
+    });
+  }
+
+  return mentions;
+}
+
 function effectiveCharacterIndex(promptText = "", imageName = "", fallbackIndex = -1) {
   const normalizedPrompt = normalizeForRoleDetection(promptText);
   const normalizedName = normalizeForRoleDetection(imageName);
@@ -307,7 +429,7 @@ export function promptMatchesReferenceItem(prompt = "", item = {}) {
   return promptContainsAutoMatchName(prompt, imageName);
 }
 
-export function matchedReferenceIdsForPrompt(prompt = "", refs = [], options = {}) {
+export function matchedReferenceDetailsForPrompt(prompt = "", refs = [], options = {}) {
   const normalizedPrompt = normalizeAutoMatchPromptText(prompt);
   if (!normalizedPrompt) return [];
 
@@ -317,32 +439,85 @@ export function matchedReferenceIdsForPrompt(prompt = "", refs = [], options = {
   );
 
   const matches = [];
+  const entityMentions = autoMatchEntityMentionsFromPrompt(prompt);
 
   for (const ref of refs || []) {
     const id = String(ref?.id || "").trim();
     if (!id) continue;
 
-    const imageName = autoMatchImageBaseName(ref);
-    if (!imageName) continue;
+    const candidates = autoMatchCandidateNameEntries(ref);
+    if (!candidates.length) continue;
 
-    if (!promptContainsAutoMatchName(normalizedPrompt, imageName)) {
+    let best = null;
+
+    for (const mention of entityMentions) {
+      for (const candidate of candidates) {
+        const matchScore = phraseContainmentScore(mention.normalized, candidate.normalized);
+        if (!matchScore) continue;
+        const score = matchScore + candidate.normalized.length;
+        if (!best || score > best.score) {
+          best = {
+            source: "heading",
+            imageName: candidate.normalized,
+            matchedName: candidate.raw,
+            entityName: mention.entityName,
+            insertionStart: mention.start,
+            insertionEnd: mention.end,
+            firstIndex: mention.start,
+            role: mention.role,
+            rolePriority: mention.rolePriority,
+            score
+          };
+        }
+      }
+    }
+
+    if (!best) {
+      for (const candidate of candidates) {
+        if (!promptContainsAutoMatchName(normalizedPrompt, candidate.normalized)) {
+          continue;
+        }
+        const firstIndex = indexOfAutoMatchName(normalizedPrompt, candidate.normalized);
+        const roleInfo = autoMatchRoleForReference(prompt, candidate.normalized, firstIndex);
+        const effectiveIndex =
+          roleInfo.role === "character"
+            ? effectiveCharacterIndex(prompt, candidate.normalized, firstIndex)
+            : firstIndex;
+        const score = candidate.normalized.length;
+        if (!best || score > best.score) {
+          best = {
+            source: "name",
+            imageName: candidate.normalized,
+            matchedName: candidate.raw,
+            entityName: "",
+            insertionStart: null,
+            insertionEnd: null,
+            firstIndex: effectiveIndex >= 0 ? effectiveIndex : Number.MAX_SAFE_INTEGER,
+            role: roleInfo.role,
+            rolePriority: roleInfo.rolePriority,
+            score
+          };
+        }
+      }
+    }
+
+    if (!best) {
       continue;
     }
 
-    const firstIndex = indexOfAutoMatchName(normalizedPrompt, imageName);
-    const roleInfo = autoMatchRoleForReference(prompt, imageName, firstIndex);
-    const effectiveIndex =
-      roleInfo.role === "character"
-        ? effectiveCharacterIndex(prompt, imageName, firstIndex)
-        : firstIndex;
-
     matches.push({
       id,
-      imageName,
-      firstIndex: effectiveIndex >= 0 ? effectiveIndex : Number.MAX_SAFE_INTEGER,
-      role: roleInfo.role,
-      rolePriority: roleInfo.rolePriority,
-      score: imageName.length
+      imageName: best.imageName,
+      matchedName: best.matchedName,
+      entityName: best.entityName,
+      actualFileName: autoMatchActualFileName(ref),
+      insertionStart: best.insertionStart,
+      insertionEnd: best.insertionEnd,
+      source: best.source,
+      firstIndex: best.firstIndex,
+      role: best.role,
+      rolePriority: best.rolePriority,
+      score: best.score
     });
   }
 
@@ -369,8 +544,42 @@ export function matchedReferenceIdsForPrompt(prompt = "", refs = [], options = {
 
       return b.score - a.score;
     })
-    .slice(0, limit || matches.length)
-    .map((item) => item.id);
+    .slice(0, limit || matches.length);
+}
+
+export function matchedReferenceIdsForPrompt(prompt = "", refs = [], options = {}) {
+  return matchedReferenceDetailsForPrompt(prompt, refs, options).map((item) => item.id);
+}
+
+function promptAlreadyContainsFileName(prompt = "", fileName = "") {
+  const raw = String(fileName || "").trim();
+  if (!raw) return false;
+  if (String(prompt || "").toLowerCase().includes(raw.toLowerCase())) return true;
+  return normalizedPromptContainsPhrase(prompt, raw);
+}
+
+export function injectAutoMatchReferenceFilenames(prompt = "", matches = []) {
+  let next = String(prompt || "");
+  const insertions = [];
+  const seenRanges = new Set();
+
+  for (const match of Array.isArray(matches) ? matches : []) {
+    const fileName = String(match?.actualFileName || "").trim();
+    const start = Number(match?.insertionStart);
+    const end = Number(match?.insertionEnd);
+    if (!fileName || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    if (promptAlreadyContainsFileName(next, fileName)) continue;
+    const key = `${start}:${end}`;
+    if (seenRanges.has(key)) continue;
+    seenRanges.add(key);
+    insertions.push({ start, end, fileName });
+  }
+
+  for (const insertion of insertions.sort((a, b) => b.end - a.end)) {
+    next = `${next.slice(0, insertion.end)} ${insertion.fileName}${next.slice(insertion.end)}`;
+  }
+
+  return next;
 }
 
 export function buildAnimatePromptAssignments(selectedImages, mode, text) {

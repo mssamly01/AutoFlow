@@ -259,6 +259,9 @@ export function createQueueExecutor({
   function taskLogFields(task = {}) {
     const refInputs = Array.isArray(task.refInputs) ? task.refInputs : [];
     const refMediaIds = Array.isArray(task.refMediaIds) ? task.refMediaIds : [];
+    const autoMatchMentions = Array.isArray(task.autoMatchReferenceMentions)
+      ? task.autoMatchReferenceMentions
+      : [];
     const inlineRefCount = refInputs.filter((ref) => Boolean(ref?.imageBytes || ref?.dataUrl || ref?.imageUrl || ref?.mediaUrl)).length;
     return {
       mode: task.mode || "",
@@ -272,7 +275,8 @@ export function createQueueExecutor({
       aspectRatio: task.aspectRatio || "",
       refCount: Math.max(refMediaIds.length, refInputs.length),
       mediaRefCount: refMediaIds.length,
-      inlineRefCount
+      inlineRefCount,
+      autoMatchReferenceCount: autoMatchMentions.length
     };
   }
 

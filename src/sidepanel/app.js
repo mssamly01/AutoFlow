@@ -2,7 +2,11 @@ import { MessageType, createMessage } from "../core/contracts/messages.js";
 import { applyTranslations, localeDiagnostics, translate } from "./i18n.js";
 import { bindRefPanel } from "./ref-panel.js";
 import { sanitizeFolderName } from "../core/gallery/media-ledger.js";
-import { matchedReferenceIdsForPrompt, splitAutoFlowPromptLine } from "../core/gallery/animate-prompts.js";
+import {
+  injectAutoMatchReferenceFilenames,
+  matchedReferenceDetailsForPrompt,
+  splitAutoFlowPromptLine
+} from "../core/gallery/animate-prompts.js";
 import { renumberSceneClips, sceneGallerySelectionIds, totalSceneDuration } from "../core/gallery/scene-builder.js";
 import { buildAutopilotF2VSeedsFromTasks } from "../core/queue/autopilot-pipeline.js";
 import { base64FromDataUrl, getReferenceBlob, putReferenceBlob } from "../core/storage/reference-blob-store.js";
@@ -10,6 +14,7 @@ import { FLOW_MODES, STORAGE_KEY, createDefaultState, mergeState } from "./runti
 import { renderControl, renderGallery, renderHistory, renderLiveQueue, renderLogs, renderScenes, renderSettings } from "./views.js";
 import { createGalleryController } from "./gallery-controller.js";
 import { ensureTaskInlineCharacterRefs, inferFirstCharacterNameFromPrompt, normalizeCharacterRefKey } from "../core/gallery/character-ref-matcher.js";
+import { materializeReferenceUploads } from "./reference-upload-preflight.js";
 
 
 const ROUTES = {
@@ -1469,7 +1474,7 @@ function bindAfterControl(root) {
       : (refImportIntent === "library" ? (state.control.activeApplyMode || "shared") : refImportIntent);
     importReferenceFiles(files, {
       intent,
-      activate: libraryOnly ? false : intent === "shared" || intent === "library" || intent === "match" || intent === "chain",
+      activate: libraryOnly ? false : intent === "shared" || intent === "library" || intent === "match" || intent === "chain" || intent === "chain_match",
       saveToLibrary: libraryOnly ? true : undefined
     });
     refImportIntent = "library";
@@ -2102,7 +2107,7 @@ function openReferenceUpload(root, forcedMode = "") {
     return;
   }
   state.control.activeApplyMode = applyMode;
-  refImportIntent = applyMode === "match" || applyMode === "chain" ? applyMode : "shared";
+  refImportIntent = applyMode === "match" || applyMode === "chain" || applyMode === "chain_match" ? applyMode : "shared";
   clickFileInputWithoutScroll(root.querySelector("#refImageInput"));
 }
 
@@ -2770,7 +2775,7 @@ function idsFromReferenceValue(value) {
 function isAutoMatchMode(currentState = state) {
   const control = currentState?.control || currentState || {};
   const mode = String(control.activeApplyMode || "").toLowerCase();
-  return mode === "match" || mode === "auto" || mode === "auto-match" || mode === "auto_match" || mode === "automatch";
+  return mode === "match" || mode === "chain_match" || mode === "auto" || mode === "auto-match" || mode === "auto_match" || mode === "automatch";
 }
 
 function referenceLimitForMode(mode = state.control.mode) {
@@ -2939,7 +2944,7 @@ async function importReferenceFiles(fileList, options = {}) {
   const saveToLibrary = options.saveToLibrary ?? state.control.saveUploadsToLibrary === true;
   const priorApplyMode = String(state.control.activeApplyMode || "shared");
   const added = await addReferenceFiles(files, { saveToLibrary });
-  if (importIntent === "match" || (importIntent === "chain" && state.control.mode === FLOW_MODES.textToImage)) {
+  if (importIntent === "match" || ((importIntent === "chain" || importIntent === "chain_match") && state.control.mode === FLOW_MODES.textToImage)) {
     state.control.activeApplyMode = importIntent;
   } else if (importIntent !== "library_only") {
     state.control.activeApplyMode = "shared";
@@ -2955,6 +2960,12 @@ async function importReferenceFiles(fileList, options = {}) {
     state.control.presets.mapLineRefs = true;
     state.control.presets.imageRepeatCount = 1;
     state.control.promptMapOpen = false;
+    state.control.promptRefMap = {};
+    state.control.oneToOneBatchRefIds = [];
+  } else if (importIntent === "chain_match" && state.control.mode === FLOW_MODES.textToImage) {
+    state.control.presets.mapLineRefs = true;
+    state.control.presets.imageRepeatCount = 1;
+    state.control.promptMapOpen = true;
     state.control.promptRefMap = {};
     state.control.oneToOneBatchRefIds = [];
   }
@@ -3478,13 +3489,14 @@ function buildAutoMatchPromptRefMapForPrompts(promptsInput = null, currentState 
 
   prompts.forEach((promptText, index) => {
     const matchText = textForAutoMatchFromPrompt(mode, promptText);
+    const matchedDetails = matchedReferenceDetailsForPrompt(matchText, refs, {
+      limit,
+      mode,
+      promptIndex: index,
+      debug: Boolean(currentState.control?.debugAutoMatch)
+    });
     const matchedIds = uniqueStrings(
-      matchedReferenceIdsForPrompt(matchText, refs, {
-        limit,
-        mode,
-        promptIndex: index,
-        debug: Boolean(currentState.control?.debugAutoMatch)
-      })
+      matchedDetails.map((item) => item.id)
     );
     setPromptRefMapEntry(map, promptText, index, matchedIds);
   });
@@ -3492,8 +3504,37 @@ function buildAutoMatchPromptRefMapForPrompts(promptsInput = null, currentState 
   return { map, refs, prompts };
 }
 
+function autoMatchReferenceDetailsForJobPrompt(promptText = "", refItems = [], options = {}) {
+  if (!isAutoMatchMode(state)) return [];
+  const prompt = String(promptText || "");
+  const refs = (refItems || [])
+    .map((item) => enrichReferenceItemForAutoMatch(item))
+    .filter((item) => String(item?.id || "").trim());
+  if (!prompt || !refs.length) return [];
+
+  return matchedReferenceDetailsForPrompt(prompt, refs, {
+    limit: Number(options.limit || refs.length || 0) || refs.length,
+    mode: options.mode || state.control?.mode,
+    promptIndex: options.promptIndex,
+    debug: Boolean(state.control?.debugAutoMatch)
+  });
+}
+
+function compactAutoMatchReferenceMentions(matches = []) {
+  return (Array.isArray(matches) ? matches : [])
+    .map((match) => ({
+      id: String(match?.id || ""),
+      entityName: String(match?.entityName || ""),
+      actualFileName: String(match?.actualFileName || ""),
+      matchedName: String(match?.matchedName || ""),
+      role: String(match?.role || ""),
+      source: String(match?.source || "")
+    }))
+    .filter((item) => item.id);
+}
+
 function applyAutoMatchPromptRefMapForRun(promptsInput = [], currentState = state) {
-  if (currentState.control?.activeApplyMode !== "match") return false;
+  if (!isAutoMatchMode(currentState)) return false;
   if (!currentState.control) currentState.control = {};
 
   const prompts = Array.isArray(promptsInput) ? promptsInput : [];
@@ -3515,18 +3556,21 @@ function applyAutoMatchPromptRefMapForRun(promptsInput = [], currentState = stat
   return true;
 }
 
-function promptMappedIds(mode, prompt, index, totalPrompts) {
+function promptMappedIds(mode, prompt, index, totalPrompts, options = {}) {
   const sourceIds = mappingSourceIdsForMode(mode);
+  const limit = Number.isFinite(Number(options.limit))
+    ? Math.max(0, Number(options.limit))
+    : referenceLimitForMode(mode);
 
-  if (state.control.activeApplyMode === "match") {
-    return getPromptMappedReferenceIds(prompt, index, state).slice(0, referenceLimitForMode(mode));
+  if (isAutoMatchMode()) {
+    return getPromptMappedReferenceIds(prompt, index, state).slice(0, limit);
   }
 
   const map = state.control.promptRefMap || {};
   const key = promptMapKey(prompt, index);
   if (Object.prototype.hasOwnProperty.call(map, key)) {
     const mapped = Array.isArray(map[key]) ? map[key] : [];
-    if (mapped.length) return mapped.slice(0, referenceLimitForMode(mode));
+    if (mapped.length) return mapped.slice(0, limit);
   }
 
   const batchIds = oneToOneBatchRefIds();
@@ -3540,7 +3584,7 @@ function promptMappedIds(mode, prompt, index, totalPrompts) {
     }
     return batchIds[index] ? [batchIds[index]] : [];
   }
-  return sourceIds;
+  return sourceIds.slice(0, limit);
 }
 
 function imageToVideoRepeatFirstSlotCount() {
@@ -3558,7 +3602,8 @@ function imageToVideoRepeatFirstSlotCount() {
 }
 
 function textToImageContinuityEnabled() {
-  return state.control.mode === FLOW_MODES.textToImage && state.control.activeApplyMode === "chain";
+  return state.control.mode === FLOW_MODES.textToImage
+    && (state.control.activeApplyMode === "chain" || state.control.activeApplyMode === "chain_match");
 }
 
 function promptPayloadForMode(mode, prompt) {
@@ -3706,67 +3751,31 @@ async function ensureMediaIds(items) {
   if (!missing.length) return items.map((item) => item.mediaId).filter(Boolean);
   const projectId = await ensureFlowProject();
   if (!projectId) throw new Error("Capture a Flow project before uploading references.");
-  await Promise.all(missing.map(async (item) => {
-    const imageBytes = await imageBytesForReferenceItem(item);
-    if (!imageBytes) {
-      item.uploadError = "reference_source_missing";
-      throw new Error(`Reference image ${item.fileName || item.title || item.id || ""} is missing its full upload data.`);
-    }
-    const response = await send(MessageType.MediaUpload, {
-      projectId,
-      files: [{
-        fileName: item.fileName || item.title || "reference.png",
-        mimeType: item.mimeType || "image/png",
-        imageBytes,
-        isHidden: false
-      }]
-    });
-    const upload = response?.payload?.uploads?.[0] || {};
-    if (upload.ok && upload.mediaId) {
-      item.mediaId = upload.mediaId;
-      item.uploadedAt = new Date().toISOString();
-    } else {
-      item.uploadError = upload.error || "upload_failed";
-      throw new Error(item.uploadError);
-    }
-  }));
-  appendLog("info", "refs", `Uploaded ${missing.length} reference image${missing.length === 1 ? "" : "s"} to Flow.`);
+  const result = await materializeReferenceUploads(items, {
+    projectId,
+    send,
+    messageType: MessageType.MediaUpload,
+    imageBytesForItem: imageBytesForReferenceItem,
+    isHidden: false
+  });
+  appendLog("info", "refs", `Uploaded ${result.uploaded.length} reference image${result.uploaded.length === 1 ? "" : "s"} to Flow.`);
   await persistState();
-  return items.map((item) => item.mediaId).filter(Boolean);
+  return result.mediaIds;
 }
 
 async function uploadReferenceItems(items, { isHidden = false, reason = "reference_upload" } = {}) {
   const projectId = await ensureFlowProject();
   if (!projectId) throw new Error("Capture a Flow project before uploading references.");
-  const uploaded = await Promise.all(items.map(async (item) => {
-    const imageBytes = await imageBytesForReferenceItem(item);
-    if (!imageBytes || /^https?:\/\//i.test(imageBytes)) {
-      item.uploadError = "reference_source_missing";
-      throw new Error(`Reference image ${item.fileName || item.title || item.id || ""} is missing its full upload data.`);
-    }
-    const response = await send(MessageType.MediaUpload, {
-      projectId,
-      files: [{
-        fileName: item.fileName || item.title || "reference.png",
-        mimeType: item.mimeType || "image/png",
-        imageBytes,
-        isHidden
-      }]
-    });
-    const upload = response?.payload?.uploads?.[0] || {};
-    if (!upload.ok || !upload.mediaId) {
-      item.uploadError = upload.error || "upload_failed";
-      throw new Error(item.uploadError);
-    }
-    if (!isHidden) {
-      item.mediaId = upload.mediaId;
-      item.uploadedAt = new Date().toISOString();
-    }
-    return upload.mediaId;
-  }));
-  appendLog("info", "refs", `Uploaded ${uploaded.length} reference image${uploaded.length === 1 ? "" : "s"} for ${reason}.`);
+  const result = await materializeReferenceUploads(items, {
+    projectId,
+    send,
+    messageType: MessageType.MediaUpload,
+    imageBytesForItem: imageBytesForReferenceItem,
+    isHidden
+  });
+  appendLog("info", "refs", `Uploaded ${result.uploaded.length} reference image${result.uploaded.length === 1 ? "" : "s"} for ${reason}.`);
   if (!isHidden) await persistState();
-  return uploaded;
+  return result.mediaIds;
 }
 
 async function fullDataUrlForReferenceItem(item = {}) {
@@ -4003,6 +4012,15 @@ async function buildJobs() {
         : refPairs.map((pair, refIndex) => refInputFromItem(pair.item, pair.role, mediaIds[refIndex] || "", { useStoredMediaId: false }));
       const startRef = refInputs.find((ref) => ref.role === "startFrameRef") || null;
       const endRef = refInputs.find((ref) => ref.role === "endFrameRef") || null;
+      const autoMatchDetails = autoMatchReferenceDetailsForJobPrompt(
+        promptPayload.prompt,
+        refPairs.map((pair) => pair.item),
+        { mode, promptIndex: index, limit: refPairs.length }
+      );
+      const autoMatchPrompt = domFirst
+        ? promptPayload.prompt
+        : injectAutoMatchReferenceFilenames(promptPayload.prompt, autoMatchDetails);
+      const autoMatchReferenceMentions = compactAutoMatchReferenceMentions(autoMatchDetails);
       const job = {
         prompt: promptPayload.prompt,
         sourcePrompt: promptPayload.sourcePrompt,
@@ -4026,10 +4044,15 @@ async function buildJobs() {
         startRefInput: startRef,
         endRefInput: endRef,
         startMediaId: startRef?.mediaId || mediaIds[0] || "",
-        endMediaId: endRef?.mediaId || ""
+        endMediaId: endRef?.mediaId || "",
+        autoMatchReferenceMentions
       };
 
-      jobs.push(await enrichTaskWithCharacterRefs(job));
+      jobs.push({
+        ...(await enrichTaskWithCharacterRefs(job)),
+        prompt: autoMatchPrompt,
+        autoMatchReferenceMentions
+      });
 
     }
     return jobs;
@@ -4038,8 +4061,10 @@ async function buildJobs() {
   for (const [index, prompt] of prompts.entries()) {
     const promptPayload = promptPayloadForMode(mode, prompt);
     const continuityChain = mode === FLOW_MODES.textToImage && state.control.activeApplyMode === "chain";
-    const mappedIds = (continuityChain && index > 0 ? [] : promptMappedIds(mode, prompt, index, prompts.length))
-      .slice(0, referenceLimitForMode(mode));
+    const continuityChainPlus = mode === FLOW_MODES.textToImage && state.control.activeApplyMode === "chain_match";
+    const mappedLimit = continuityChainPlus && index > 0 ? Math.max(0, referenceLimitForMode(mode) - 1) : referenceLimitForMode(mode);
+    const mappedIds = (continuityChain && index > 0 ? [] : promptMappedIds(mode, prompt, index, prompts.length, { limit: mappedLimit }))
+      .slice(0, mappedLimit);
     const fallbackRole = mode === FLOW_MODES.ingredientsToVideo ? "ingredientsRefs" : "imagePromptRefs";
     const refPairs = savedItemsForIds(mappedIds).map((item) => ({
       item,
@@ -4057,6 +4082,15 @@ async function buildJobs() {
     const refInputs = domFirstInlineRefUpload
       ? await Promise.all(refPairs.map((pair) => domUploadRefInputFromItem(pair.item, pair.role)))
       : refPairs.map((pair, refIndex) => refInputFromItem(pair.item, pair.role, mediaIds[refIndex] || ""));
+    const autoMatchDetails = autoMatchReferenceDetailsForJobPrompt(
+      promptPayload.prompt,
+      refPairs.map((pair) => pair.item),
+      { mode, promptIndex: index, limit: refPairs.length }
+    );
+    const autoMatchPrompt = domFirst
+      ? promptPayload.prompt
+      : injectAutoMatchReferenceFilenames(promptPayload.prompt, autoMatchDetails);
+    const autoMatchReferenceMentions = compactAutoMatchReferenceMentions(autoMatchDetails);
     const job = {
       prompt: promptPayload.prompt,
       sourcePrompt: promptPayload.sourcePrompt,
@@ -4070,11 +4104,16 @@ async function buildJobs() {
       submitPath: state.control.presets.submitPath,
       mediaIds,
       refInputs,
-      referenceChainMode: continuityChain && index > 0 ? "previous_output" : "",
-      referenceChainSeed: continuityChain && index === 0,
-      referenceChainIndex: continuityChain ? index : null
+      referenceChainMode: (continuityChain || continuityChainPlus) && index > 0 ? "previous_output" : "",
+      referenceChainSeed: (continuityChain || continuityChainPlus) && index === 0,
+      referenceChainIndex: (continuityChain || continuityChainPlus) ? index : null,
+      autoMatchReferenceMentions
     };
-    jobs.push(await enrichTaskWithCharacterRefs(job));
+    jobs.push({
+      ...(await enrichTaskWithCharacterRefs(job)),
+      prompt: autoMatchPrompt,
+      autoMatchReferenceMentions
+    });
 
   }
   return jobs;

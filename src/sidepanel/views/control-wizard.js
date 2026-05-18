@@ -625,10 +625,14 @@ function buildStep2Body(state, dispatch) {
   const activeRefIds = activeReferenceIdsForMode(state);
   const limit = REF_LIMITS[mode] ?? 0;
   const activeCta = state.control?.activeApplyMode || "shared";
-  const isAuto = String(state.control?.activeApplyMode || "").toLowerCase() === "match";
+  const applyMode = String(state.control?.activeApplyMode || "").toLowerCase();
+  const isAuto = applyMode === "match" || applyMode === "chain_match";
+  const isChainMatch = mode === FLOW_MODES.textToImage && applyMode === "chain_match";
   const refCopy = mode === FLOW_MODES.textToVideo
     ? tr(state, "textToVideoNoRefs")
-    : isAuto
+    : isChainMatch
+      ? tr(state, "continuityPromptPlusTip")
+      : isAuto
       ? "Auto-match can select all Library images. Only matching filenames are used per task."
       : mode === FLOW_MODES.imageToVideo
         ? tr(state, "frameToVideoRefsHelp")
@@ -712,6 +716,9 @@ function buildStep2Body(state, dispatch) {
     mode === FLOW_MODES.textToImage
       ? cta("chain", tr(state, "continuityPrompt"), tr(state, "continuityPromptSub"), "linear_scale", tr(state, "continuityPromptTip"))
       : null,
+    mode === FLOW_MODES.textToImage
+      ? cta("chain_match", tr(state, "continuityPromptPlus"), tr(state, "continuityPromptPlusSub"), "hub", tr(state, "continuityPromptPlusTip"))
+      : null,
     cta("match",  tr(state, "autoMatch"),        tr(state, "autoMatchSub"), "auto_fix_high", tr(state, "autoMatchTip")),
   ].filter(Boolean);
   const ctaGrid = el("div", { class: "afw-cta-grid" }, ...ctaItems);
@@ -789,7 +796,7 @@ function applyModePatch(state = {}, modeKey = "shared") {
   const currentBatch = Array.isArray(control.oneToOneBatchRefIds)
     ? control.oneToOneBatchRefIds.map((id) => String(id || "").trim()).filter(Boolean)
     : [];
-  const isAuto = modeKey === "match";
+  const isAuto = modeKey === "match" || modeKey === "chain_match";
   const ids = isAuto
     ? activeReferenceIdsForMode(state)
     : activeReferenceIdsForMode(state).slice(0, modeKey === "batch" ? 500 : referenceLimitForMode(control.mode));
@@ -833,6 +840,17 @@ function applyModePatch(state = {}, modeKey = "shared") {
         : (currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references, isAuto) : control.references),
       presets: { mapLineRefs: true, imageRepeatCount: 1 },
       promptMapOpen: false
+    };
+  }
+  if (modeKey === "chain_match") {
+    return {
+      ...base,
+      oneToOneBatchRefIds: [],
+      references: control.mode === FLOW_MODES.textToImage
+        ? referencesPatchForMode(control.mode, ids, control.references, isAuto)
+        : (currentBatch.length ? referencesPatchForMode(control.mode, ids, control.references, isAuto) : control.references),
+      presets: { mapLineRefs: true, imageRepeatCount: 1 },
+      promptMapOpen: true
     };
   }
   return {
@@ -906,7 +924,7 @@ function activeReferenceIdsForMode(state) {
   const batch = Array.isArray(state.control?.oneToOneBatchRefIds) ? state.control.oneToOneBatchRefIds : [];
   if (batch.length) return batch.map((id) => String(id || "").trim()).filter(Boolean);
 
-  const isAuto = String(state.control?.activeApplyMode || "").toLowerCase() === "match";
+  const isAuto = ["match", "chain_match"].includes(String(state.control?.activeApplyMode || "").toLowerCase());
 
   if (state.control?.mode === FLOW_MODES.textToImage) {
     const list = [...idsFromValue(refs.imagePromptRefs), ...idsFromValue(refs.styleRefRefs), ...idsFromValue(refs.omniRefRefs)];
@@ -1004,7 +1022,8 @@ function buildStep3Body(state, prompts, refs, mode) {
     ? [["portrait", tr(state, "portrait")], ["square", tr(state, "square")], ["landscape", tr(state, "landscape")], ["portrait_3_4", "3:4"], ["landscape_4_3", "4:3"]]
     : [["portrait", tr(state, "portrait")], ["landscape", tr(state, "landscape")]];
   const countOptions = [["1", "x1"], ["2", "x2"], ["3", "x3"], ["4", "x4"]];
-  const continuityMode = mode.key === FLOW_MODES.textToImage && state.control?.activeApplyMode === "chain";
+  const continuityMode = mode.key === FLOW_MODES.textToImage
+    && (state.control?.activeApplyMode === "chain" || state.control?.activeApplyMode === "chain_match");
   const downloadOptions = mode.key === FLOW_MODES.textToImage
     ? [["1k", "1K"], ["2k", "2K"], ["4k", "4K"]]
     : [["720p", "720p"], ["1080p", "1080p"], ["4k", "4K"]];
@@ -1119,6 +1138,17 @@ function effectiveRefIdsForPrompt(state, prompt, index, totalPrompts) {
     return ["__af_previous_output__"];
   }
   const sourceIds = activeReferenceIdsForMode(state);
+  if (state.control?.mode === FLOW_MODES.textToImage && state.control?.activeApplyMode === "chain_match") {
+    const split = splitAutoFlowPromptLine(prompt);
+    const matchText = String(split.imagePrompt || split.prompt || prompt || "").trim();
+    const limit = index > 0 ? Math.max(0, referenceLimitForMode(state.control.mode) - 1) : referenceLimitForMode(state.control.mode);
+    const matchedIds = matchedReferenceIdsForPrompt(
+      matchText,
+      allReferenceItems(state).filter((item) => sourceIds.includes(item.id)),
+      { limit, mode: state.control.mode, promptIndex: index, debug: false }
+    );
+    return index > 0 ? ["__af_previous_output__", ...matchedIds] : matchedIds;
+  }
 
   if (String(state.control?.activeApplyMode || "").toLowerCase() === "match") {
     const mode = state.control?.mode;
