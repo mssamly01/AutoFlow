@@ -142,6 +142,7 @@ export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
         overlapStartedAt: task?.overlapStartedAt || now,
         overlapUnlockedNext: false,
         overlapUnlockReason: "",
+        overlapUnlockConsumedAt: "",
         progressPercent: null,
         progressUpdatedAt: "",
         lastProgressSource: ""

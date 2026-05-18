@@ -3879,6 +3879,12 @@ function filterOverlapTasksForSubmitSlots(tasks = [], freeSlots = 0) {
   return out;
 }
 
+function nextConsumableOverlapUnlockTask() {
+  return overlapController
+    .getActiveTasks()
+    .find((task) => task?.overlapUnlockedNext === true && !task?.overlapUnlockConsumedAt) || null;
+}
+
 function pumpOverlapQueue(tabId) {
   if (!runtimeState.queueRunning) {
     stopOverlapTimerIfIdle();
@@ -3908,6 +3914,15 @@ function pumpOverlapQueue(tabId) {
 
   for (const task of tasksToStart) {
     if (activeSubmitRuns.has(task.id) || activeWatchRuns.has(task.id)) continue;
+
+    const unlockTask = totalActiveCount > 0 ? nextConsumableOverlapUnlockTask() : null;
+    if (totalActiveCount > 0 && !unlockTask) continue;
+    if (unlockTask) {
+      overlapController.markUnlockConsumed(unlockTask.id);
+      logOverlapSubmit("UNLOCK_CONSUMED", unlockTask.id, {
+        nextTaskId: task.id
+      });
+    }
 
     logOverlapSubmit("SUBMIT_START", task.id);
 

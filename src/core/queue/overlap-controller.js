@@ -84,18 +84,21 @@ export function createOverlapController({
 
     if (freeSlots <= 0) return [];
 
-    // If overlap is enabled and we have active tasks, we only start the next one
-    // if at least one active task has unlocked (or if we haven't reached max capacity yet
-    // and the last started task has unlocked).
-    // Actually, the simplest logic is: if we have any active task, 
-    // at least one MUST have overlapUnlockedNext === true to start one more.
+    let startLimit = freeSlots;
+
+    // In overlap mode, starts are paced one-by-one. The first task starts
+    // immediately; each later task needs one active task to unlock it after
+    // overlapDelaySeconds.
     if (config.enabled && activeCount > 0) {
       const hasUnlock = activeTasks.some(t => t.overlapUnlockedNext === true);
       if (!hasUnlock) return [];
+      startLimit = 1;
+    } else if (config.enabled) {
+      startLimit = 1;
     }
 
     if (typeof scheduler.nextPendingTasks === "function") {
-      return scheduler.nextPendingTasks(freeSlots);
+      return scheduler.nextPendingTasks(startLimit);
     }
 
     const one = scheduler.nextPendingTask?.();
@@ -115,6 +118,10 @@ export function createOverlapController({
 
     if (task.overlapUnlockedNext === true) {
       return { ok: false, reason: "already_unlocked" };
+    }
+
+    if (task.overlapUnlockConsumedAt) {
+      return { ok: false, reason: "unlock_consumed" };
     }
 
     if (!isOverlapActiveTask(task)) {
@@ -146,6 +153,16 @@ export function createOverlapController({
     });
   }
 
+  function markUnlockConsumed(taskId) {
+    const task = ledger.getTask(taskId);
+    if (!task) return null;
+
+    return ledger.updateTask(taskId, {
+      overlapUnlockedNext: false,
+      overlapUnlockConsumedAt: new Date(now()).toISOString()
+    });
+  }
+
   function maybeUnlockFromTask(taskId) {
     const task = ledger.getTask(taskId);
     const decision = shouldUnlockNextTask(task);
@@ -163,6 +180,7 @@ export function createOverlapController({
     pickNextTasksToStart,
     shouldUnlockNextTask,
     markUnlockedNext,
+    markUnlockConsumed,
     maybeUnlockFromTask,
     markTaskProgress(taskId, _percent, _source) {
       // Stub: purely time-based gating is now handled via shouldUnlockNextTask

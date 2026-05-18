@@ -144,6 +144,7 @@ export function createTaskLedger(initialTasks = []) {
       overlapStartedAt: String(task.overlapStartedAt || ""),
       overlapUnlockedNext: task.overlapUnlockedNext === true,
       overlapUnlockReason: String(task.overlapUnlockReason || ""),
+      overlapUnlockConsumedAt: String(task.overlapUnlockConsumedAt || ""),
       progressPercent: Number.isFinite(Number(task.progressPercent))
         ? Number(task.progressPercent)
         : null,
@@ -213,6 +214,7 @@ export function createTaskLedger(initialTasks = []) {
         overlapStartedAt: "",
         overlapUnlockedNext: false,
         overlapUnlockReason: "",
+        overlapUnlockConsumedAt: "",
         progressPercent: null,
         progressUpdatedAt: "",
         lastProgressSource: "",
