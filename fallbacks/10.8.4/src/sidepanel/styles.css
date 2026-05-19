@@ -4671,6 +4671,12 @@ button:active:not(:disabled) {
   overflow: hidden;
 }
 
+.live-task-ref-strip.is-expanded {
+  flex-wrap: wrap;
+  max-width: min(220px, 42vw);
+  overflow: visible;
+}
+
 .live-task-ref-thumb {
   width: 34px;
   height: 34px;
@@ -4684,6 +4690,15 @@ button:active:not(:disabled) {
   cursor: zoom-in;
 }
 
+.live-task-ref-strip.is-collapsed .live-task-ref-thumb.is-extra-ref {
+  display: none;
+}
+
+.live-task-ref-strip.is-expanded .live-task-ref-more,
+.live-task-ref-more[hidden] {
+  display: none;
+}
+
 .live-task-ref-more {
   min-width: 26px;
   height: 24px;
@@ -4693,8 +4708,16 @@ button:active:not(:disabled) {
   padding: 0 7px;
   background: rgba(121, 151, 226, 0.12);
   color: var(--af-text-soft);
+  border: 1px solid rgba(121, 151, 226, 0.18);
   font-size: 10px;
   font-weight: 900;
+  cursor: pointer;
+}
+
+.live-task-ref-more:hover {
+  color: var(--af-text);
+  border-color: rgba(121, 151, 226, 0.42);
+  background: rgba(121, 151, 226, 0.18);
 }
 
 .live-output-strip {

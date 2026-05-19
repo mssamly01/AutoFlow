@@ -265,18 +265,36 @@ export function createGalleryController(deps) {
       });
     });
     root.querySelectorAll("[data-live-preview-url]").forEach((button) => {
-      button.addEventListener("dblclick", async (event) => {
+      const openLivePreview = (event) => {
         event.preventDefault();
         event.stopPropagation();
+        const previewItems = liveQueuePreviewItems(button);
         openMediaPreview({
-          items: liveQueuePreviewItems(),
-          index: liveQueuePreviewItems().findIndex((item) => item.url === button.dataset.livePreviewUrl),
+          items: previewItems,
+          index: previewItems.findIndex((item) => item.button === button),
           url: button.dataset.livePreviewUrl,
           kind: button.dataset.livePreviewKind,
           title: button.dataset.livePreviewTitle || "Live queue preview"
         });
-      });
+      };
+      if (button.classList.contains("live-task-ref-thumb") || button.classList.contains("live-task-thumb")) {
+        button.addEventListener("click", openLivePreview);
+      }
+      button.addEventListener("dblclick", openLivePreview);
     });
+    root.querySelectorAll("[data-live-ref-expand-group]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const group = String(button.dataset.liveRefExpandGroup || "");
+        const strip = button.closest(".live-task-ref-strip")
+          || [...root.querySelectorAll(".live-task-ref-strip")].find((entry) => String(entry.dataset.liveRefGroup || "") === group);
+      if (!strip) return;
+      strip.classList.remove("is-collapsed");
+      strip.classList.add("is-expanded");
+      button.remove();
+    });
+  });
     root.querySelectorAll("[data-live-regenerate-task-id]").forEach((button) => {
       button.addEventListener("click", async (event) => {
         event.preventDefault();
@@ -588,10 +606,17 @@ export function createGalleryController(deps) {
       .filter((item) => item.url);
   }
 
-  function liveQueuePreviewItems() {
-    return [...document.querySelectorAll(".live-output-slot[data-live-preview-url]")]
+  function liveQueuePreviewItems(sourceButton = null) {
+    const scope = String(sourceButton?.dataset?.livePreviewScope || "");
+    const group = String(sourceButton?.dataset?.livePreviewGroup || "");
+    const selector = scope === "refs" && group
+      ? "[data-live-preview-url][data-live-preview-scope='refs']"
+      : ".live-output-slot[data-live-preview-url]";
+    return [...document.querySelectorAll(selector)]
+      .filter((button) => !group || String(button.dataset.livePreviewGroup || "") === group)
       .map((button, index) => ({
         id: `${button.dataset.livePreviewUrl || ""}:${index}`,
+        button,
         url: button.dataset.livePreviewUrl || "",
         kind: button.dataset.livePreviewKind || "images",
         title: button.dataset.livePreviewTitle || `Output ${index + 1}`

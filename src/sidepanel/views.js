@@ -1712,27 +1712,58 @@ function liveQueueTaskThumb(item = {}, locale = "en") {
   const refPreviews = liveQueueInputReferencePreviews(item);
   if (refPreviews.length > 1) {
     const visibleRefs = refPreviews.slice(0, 3);
-    return el("span", { class: "live-task-ref-strip", attrs: { title: `${refPreviews.length} input reference${refPreviews.length === 1 ? "" : "s"}` } },
-      visibleRefs.map((preview, index) => el("button", {
-        class: "live-task-ref-thumb",
-        data: { livePreviewUrl: preview.src, livePreviewKind: preview.kind, livePreviewTitle: `${preview.title} ${index + 1}` },
+    const groupId = liveQueueReferenceGroupId(item);
+    return el("span", {
+      class: `live-task-ref-strip${refPreviews.length > visibleRefs.length ? " is-collapsed" : ""}`,
+      data: { liveRefGroup: groupId },
+      attrs: { title: `${refPreviews.length} input reference${refPreviews.length === 1 ? "" : "s"}` }
+    },
+      refPreviews.map((preview, index) => el("button", {
+        class: `live-task-ref-thumb${index >= visibleRefs.length ? " is-extra-ref" : ""}`,
+        data: {
+          livePreviewUrl: preview.previewUrl || preview.src,
+          livePreviewKind: preview.kind,
+          livePreviewTitle: `${preview.title} ${index + 1}`,
+          livePreviewScope: "refs",
+          livePreviewGroup: groupId,
+          livePreviewIndex: String(index)
+        },
         attrs: { type: "button", title: translate("doubleClickToPreview", {}, locale) }
       }, liveQueuePreviewMedia(preview, "thumb"))),
-      refPreviews.length > visibleRefs.length ? el("span", { class: "live-task-ref-more", text: `+${refPreviews.length - visibleRefs.length}` }) : null
+      refPreviews.length > visibleRefs.length
+        ? el("button", {
+            class: "live-task-ref-more",
+            data: { liveRefExpandGroup: groupId },
+            attrs: { type: "button", title: "Show all reference images" },
+            text: `+${refPreviews.length - visibleRefs.length}`
+          })
+        : null
     );
   }
   if (item.mode === FLOW_MODES.textToImage && !refPreviews.length) return null;
   const preview = liveQueuePrimaryPreview(item);
   if (preview.src) {
+    const groupId = liveQueueReferenceGroupId(item);
     return el("button", {
       class: "live-task-thumb",
-      data: { livePreviewUrl: preview.src, livePreviewKind: preview.kind, livePreviewTitle: preview.title },
+      data: {
+        livePreviewUrl: preview.previewUrl || preview.src,
+        livePreviewKind: preview.kind,
+        livePreviewTitle: preview.title,
+        livePreviewScope: "refs",
+        livePreviewGroup: groupId,
+        livePreviewIndex: "0"
+      },
       attrs: { type: "button", title: translate("doubleClickToPreview", {}, locale) }
     },
       liveQueuePreviewMedia(preview, "thumb")
     );
   }
   return el("span", { class: "live-task-thumb empty" }, icon(item.mode === FLOW_MODES.textToImage ? "image" : "movie"));
+}
+
+function liveQueueReferenceGroupId(item = {}) {
+  return `refs:${String(item.id || item.jobId || item.batchId || item.prompt || "task").replace(/\s+/g, "-")}`;
 }
 
 function liveQueuePrimaryPreview(item = {}) {
@@ -1748,11 +1779,13 @@ function liveQueueInputReferencePreviews(item = {}) {
   return refs
     .map((ref, index) => {
       const src = ref?.imageUrl || ref?.dataUrl || ref?.mediaUrl || "";
+      const previewUrl = ref?.dataUrl || ref?.mediaUrl || ref?.imageUrl || "";
       const id = String(ref?.mediaId || ref?.assetImageId || ref?.id || ref?.blobStoreId || src || `${index}`).trim();
       if (!src || seen.has(id)) return null;
       seen.add(id);
       return {
         src,
+        previewUrl,
         kind: "images",
         mediaId: id,
         galleryId: id,
@@ -1768,6 +1801,7 @@ function liveQueueInputPreview(item = {}) {
   const src = refSrc || item.imageUrl || item.thumbnailUrl || "";
   return {
     src,
+    previewUrl: refPreview?.previewUrl || src,
     kind: "images",
     mediaId: refPreview?.mediaId || item.mediaId || "",
     galleryId: refPreview?.galleryId || item.galleryId || "",
