@@ -4604,7 +4604,7 @@ async function runQueue() {
 }
 
 async function resumeQueue() {
-  const response = await send(MessageType.QueueResume, { environment: authEnvironment() });
+  const response = await send(MessageType.QueueResume, { environment: authEnvironment(), presets: state.control.presets });
   applyRuntimePayload(response?.payload || {});
   const resumed = Number(response?.payload?.resumed || 0);
   const pending = Number(response?.payload?.pending || 0);

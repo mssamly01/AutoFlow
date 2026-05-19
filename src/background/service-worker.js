@@ -5166,6 +5166,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       await queueReady;
       captureAuthEnvironment(message.payload || {});
+      if (message.payload?.presets && typeof message.payload.presets === "object") {
+        runtimeState.overlapPresets = message.payload.presets;
+      }
       const pendingBeforeResume = scheduler.nextPendingTask();
       const next = pendingBeforeResume || ledger.listTasks().find((task) => String(task.status || "").toLowerCase() === "blocked");
       if (next) {
@@ -5194,6 +5197,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await persistQueueState();
       recordEvent({ type: "queue.resume_blocked", resumed, pending });
       if ((resumed > 0 || pendingAfterResume) && !runtimeState.queueRunning) {
+        queueStartingTaskId = pendingAfterResume?.id || "";
         runQueueUntilIdle(Number(message.payload?.tabId || sender?.tab?.id || 0) || undefined);
       }
       sendResponse(createMessage(MessageType.QueueResume, {
