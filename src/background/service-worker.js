@@ -109,8 +109,12 @@ const submitLock = createAsyncMutex();
 const activeTaskRuns = new Map();
 const activeSubmitRuns = new Map();
 const activeWatchRuns = new Map();
+let queueStartingTaskId = "";
 
 let overlapTimerId = null;
+let overlapLastTaskStartedAtMs = 0;
+let overlapLastTaskStartedId = "";
+let overlapReachedMaxConcurrent = false;
 const overlapController = createOverlapController({
   ledger,
   scheduler,
@@ -413,12 +417,35 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   });
 });
 
+function clearQueueStartingTask(taskId = "") {
+  if (!queueStartingTaskId) return;
+  if (!taskId || String(queueStartingTaskId) === String(taskId)) {
+    queueStartingTaskId = "";
+  }
+}
+
+function queueSnapshotTasks() {
+  const activeSubmitIds = new Set([...activeSubmitRuns.keys()].map((taskId) => String(taskId || "")));
+  const startingTaskId = String(queueStartingTaskId || "");
+  return ledger.listTasks().map((task) => {
+    const id = String(task?.id || "");
+    const isRuntimeSubmitting = runtimeState.queueRunning
+      && task?.status === TaskStatus.pending
+      && (activeSubmitIds.has(id) || (startingTaskId && startingTaskId === id));
+    if (!isRuntimeSubmitting) return task;
+    return {
+      ...task,
+      status: TaskStatus.submitting,
+      runtimeStatus: "submitting",
+      runtimeSubmitting: true
+    };
+  });
+}
+
 function queueState() {
   repairQueueDownloadStateFromEvents("queue_state");
-  const tasks = ledger.listTasks();
-  const taskLedgerSnapshot = typeof ledger.debugSnapshot === "function"
-    ? ledger.debugSnapshot()
-    : tasks.map((task) => sanitizeTaskForDebugReport(task));
+  const tasks = queueSnapshotTasks();
+  const taskLedgerSnapshot = tasks.map((task) => sanitizeTaskForDebugReport(task));
   return {
     tasks,
     taskLedgerSnapshot,
@@ -2568,6 +2595,7 @@ function createExecutorForTab(tabId) {
       }
     },
     async onTaskStateChange({ taskId, reason, task } = {}) {
+      if (reason === "submitting") clearQueueStartingTask(taskId);
       recordEvent({
         type: "queue.task.state",
         taskId: taskId || task?.id || "",
@@ -3879,10 +3907,40 @@ function filterOverlapTasksForSubmitSlots(tasks = [], freeSlots = 0) {
   return out;
 }
 
-function nextConsumableOverlapUnlockTask() {
+function resetOverlapStartPace() {
+  overlapLastTaskStartedAtMs = 0;
+  overlapLastTaskStartedId = "";
+  overlapReachedMaxConcurrent = false;
+}
+
+function taskOverlapStartMs(task = {}) {
+  const raw =
+    task.overlapStartedAt ||
+    task.submitAttemptStartedAt ||
+    task.submittedAt ||
+    "";
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function latestActiveOverlapStartMs() {
   return overlapController
     .getActiveTasks()
-    .find((task) => task?.overlapUnlockedNext === true && !task?.overlapUnlockConsumedAt) || null;
+    .reduce((latest, task) => Math.max(latest, taskOverlapStartMs(task)), 0);
+}
+
+function overlapStartPaceWaitMs(config = {}) {
+  const delayMs = Math.max(0, Number(config.delaySeconds || 0) * 1000);
+  if (!delayMs) return 0;
+  const latestStartedAtMs = Math.max(overlapLastTaskStartedAtMs, latestActiveOverlapStartMs());
+  if (!latestStartedAtMs) return 0;
+  return Math.max(0, latestStartedAtMs + delayMs - Date.now());
+}
+
+function markOverlapTaskStarted(taskId) {
+  overlapLastTaskStartedAtMs = Date.now();
+  overlapLastTaskStartedId = String(taskId || "");
+  clearQueueStartingTask(taskId);
 }
 
 function pumpOverlapQueue(tabId) {
@@ -3902,30 +3960,45 @@ function pumpOverlapQueue(tabId) {
     overlapController.maybeUnlockFromTask(task.id);
   }
 
-  const totalActiveCount = activeTasks.length;
+  const activeTaskIds = new Set(activeTasks.map((task) => String(task.id || "")));
+  const inFlightSubmitOnlyCount = [...activeSubmitRuns.keys()]
+    .filter((taskId) => !activeTaskIds.has(String(taskId)))
+    .length;
+  const totalActiveCount = activeTasks.length + inFlightSubmitOnlyCount;
   const freeSlots = Math.max(0, config.maxConcurrentTasks - totalActiveCount);
+  if (totalActiveCount >= config.maxConcurrentTasks) {
+    overlapReachedMaxConcurrent = true;
+  }
   if (freeSlots <= 0) return;
-  if (activeSubmitRuns.size > 0) return;
 
-  const tasks = overlapController.pickNextTasksToStart();
+  const refillMode = overlapReachedMaxConcurrent === true;
+  if (!refillMode) {
+    const waitMs = overlapStartPaceWaitMs(config);
+    if (waitMs > 0) return;
+  }
+
+  const tasks = overlapController.pickNextTasksToStart(refillMode ? freeSlots : 1);
   if (!tasks.length) return;
 
   const tasksToStart = filterOverlapTasksForSubmitSlots(tasks, freeSlots);
   if (!tasksToStart.length) return;
 
+  let startedCount = 0;
   for (const task of tasksToStart) {
     if (activeSubmitRuns.has(task.id) || activeWatchRuns.has(task.id)) continue;
 
-    const unlockTask = totalActiveCount > 0 ? nextConsumableOverlapUnlockTask() : null;
-    if (totalActiveCount > 0 && !unlockTask) continue;
-    if (unlockTask) {
-      overlapController.markUnlockConsumed(unlockTask.id);
-      logOverlapSubmit("UNLOCK_CONSUMED", unlockTask.id, {
-        nextTaskId: task.id
-      });
+    const previousTaskId = overlapLastTaskStartedId;
+    markOverlapTaskStarted(task.id);
+    startedCount += 1;
+    if (totalActiveCount + startedCount >= config.maxConcurrentTasks) {
+      overlapReachedMaxConcurrent = true;
     }
-
-    logOverlapSubmit("SUBMIT_START", task.id);
+    logOverlapSubmit("SUBMIT_START", task.id, {
+      delaySeconds: config.delaySeconds,
+      maxConcurrentTasks: config.maxConcurrentTasks,
+      previousTaskId,
+      refillMode
+    });
 
     const executor = createExecutorForTab(tabId);
     const runPromise = (async () => {
@@ -3991,7 +4064,6 @@ function pumpOverlapQueue(tabId) {
 }
 
 async function runQueueUntilIdle(preferredTabId) {
-  await queueReady;
   if (runtimeState.queueRunning) return;
   const runToken = Number(runtimeState.queueRunToken || 0) + 1;
   runtimeState.queueRunToken = runToken;
@@ -4000,12 +4072,16 @@ async function runQueueUntilIdle(preferredTabId) {
   const isActiveRun = () => runtimeState.queueRunning && runtimeState.queueRunToken === runToken;
   recordEvent({ type: "queue.start", runToken });
   try {
+    await queueReady;
     const tab = await findFlowTab(preferredTabId);
     if (!tab?.id) throw new Error("flow_tab_not_found");
 
     const config = overlapController.getConfig();
     if (config.enabled && config.maxConcurrentTasks > 1) {
       console.info("[AutoFlow][Overlap] Overlap submit loop active.");
+      if (!overlapController.getActiveTasks().length && !activeSubmitRuns.size && !activeWatchRuns.size) {
+        resetOverlapStartPace();
+      }
       startOverlapTimer(tab.id);
       pumpOverlapQueue(tab.id);
 
@@ -4023,6 +4099,9 @@ async function runQueueUntilIdle(preferredTabId) {
       }
 
       stopOverlapTimerIfIdle();
+      if (!scheduler.nextPendingTasks(1).length && !overlapController.getActiveTasks().length && !activeSubmitRuns.size && !activeWatchRuns.size) {
+        resetOverlapStartPace();
+      }
       return;
     }
 
@@ -4119,6 +4198,7 @@ async function runQueueUntilIdle(preferredTabId) {
         if (continuity.waiting) continue;
         if (continuity.blocked) continue;
         const nextTask = continuity.task || ledger.getTask(next.id) || next;
+        queueStartingTaskId = nextTask.id;
         await ensureTaskProjectId(nextTask, tab.id);
         await persistQueueState();
         if (!isActiveRun()) break;
@@ -4239,6 +4319,7 @@ async function runQueueUntilIdle(preferredTabId) {
     }
   } finally {
     stopOverlapTimerIfIdle();
+    clearQueueStartingTask();
     await releaseDebuggerSessions("queue_finished", recordDebuggerTrace);
     if (runtimeState.queueRunToken === runToken) {
       runtimeState.queueRunning = false;
@@ -5066,6 +5147,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       if (!runtimeState.queueRunning) {
+        queueStartingTaskId = next?.id || "";
         runQueueUntilIdle(Number(message.payload?.tabId || sender?.tab?.id || 0) || undefined);
       }
       sendResponse(createMessage(MessageType.QueueStart, {
@@ -5131,6 +5213,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === MessageType.QueueStop) {
     runtimeState.queueRunToken = Number(runtimeState.queueRunToken || 0) + 1;
     runtimeState.queueRunning = false;
+    clearQueueStartingTask();
+    resetOverlapStartPace();
     recordEvent({ type: "queue.stop.request", runToken: runtimeState.queueRunToken });
     (async () => {
       await queueReady;
@@ -5151,6 +5235,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await queueReady;
       if (!runtimeState.queueRunning) {
         runtimeState.queueRunToken = Number(runtimeState.queueRunToken || 0) + 1;
+        clearQueueStartingTask();
+        resetOverlapStartPace();
         ledger.clearTasks();
         recordEvent({ type: "queue.clear", runToken: runtimeState.queueRunToken });
       }

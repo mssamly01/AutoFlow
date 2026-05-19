@@ -2,18 +2,13 @@
 // Manages concurrency gating: decides when the next task can start
 // based on a time-based delay (overlapDelaySeconds).
 //
-// Starts are paced one-by-one. Submit work stays serialized; generation,
-// polling, and downloads can overlap up to the configured slot count.
+// Starts are paced one-by-one. The background pump owns the delay between
+// starts; this controller only enforces active-slot limits and task metadata.
 
 import { TaskStatus } from "./task-ledger.js";
 
 const ACTIVE_STATUSES = new Set([
   TaskStatus.submitting,
-  TaskStatus.generating,
-  TaskStatus.downloading
-]);
-
-const UNLOCKABLE_STATUSES = new Set([
   TaskStatus.generating,
   TaskStatus.downloading
 ]);
@@ -41,10 +36,10 @@ export function isOverlapActiveTask(task = {}) {
 
 function getTaskDelayBaseAtMs(task = {}) {
   const raw =
-    task.submittedAt ||
     task.overlapStartedAt ||
-    task.startedAt ||
     task.submitAttemptStartedAt ||
+    task.submittedAt ||
+    task.startedAt ||
     "";
 
   const parsed = Date.parse(raw);
@@ -80,7 +75,7 @@ export function createOverlapController({
     return Math.max(0, config.maxConcurrentTasks - activeCount);
   }
 
-  function pickNextTasksToStart() {
+  function pickNextTasksToStart(limit = null) {
     const config = getConfig();
     const activeTasks = getActiveTasks();
     const activeCount = activeTasks.length;
@@ -88,18 +83,10 @@ export function createOverlapController({
 
     if (freeSlots <= 0) return [];
 
-    let startLimit = freeSlots;
-
-    // In overlap mode, starts are paced one-by-one. The first task starts
-    // immediately; each later task needs one active task to unlock it after
-    // overlapDelaySeconds.
-    if (config.enabled && activeCount > 0) {
-      const hasUnlock = activeTasks.some(t => t.overlapUnlockedNext === true);
-      if (!hasUnlock) return [];
-      startLimit = 1;
-    } else if (config.enabled) {
-      startLimit = 1;
-    }
+    const requestedLimit = Number(limit);
+    const startLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(freeSlots, requestedLimit)
+      : (config.enabled ? 1 : freeSlots);
 
     if (typeof scheduler.nextPendingTasks === "function") {
       return scheduler.nextPendingTasks(startLimit);
@@ -128,8 +115,8 @@ export function createOverlapController({
       return { ok: false, reason: "unlock_consumed" };
     }
 
-    if (!UNLOCKABLE_STATUSES.has(task.status)) {
-      return { ok: false, reason: isOverlapActiveTask(task) ? "task_not_ready" : "task_not_active" };
+    if (!isOverlapActiveTask(task)) {
+      return { ok: false, reason: "task_not_active" };
     }
 
     const startedAtMs = getTaskDelayBaseAtMs(task);

@@ -139,7 +139,7 @@ export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
         status: TaskStatus.submitting,
         attempts: Number(task?.attempts || 0) + 1,
         submitAttemptStartedAt: now,
-        overlapStartedAt: task?.overlapStartedAt || now,
+        overlapStartedAt: now,
         overlapUnlockedNext: false,
         overlapUnlockReason: "",
         overlapUnlockConsumedAt: "",
