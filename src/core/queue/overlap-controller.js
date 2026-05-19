@@ -2,14 +2,18 @@
 // Manages concurrency gating: decides when the next task can start
 // based on a time-based delay (overlapDelaySeconds).
 //
-// API submits can run in parallel up to the configured slot count.
-// DOM submits share one composer/debugger path, so only the DOM submit action is
-// serialized while generation/polling still overlaps for DOM and API tasks.
+// Starts are paced one-by-one. Submit work stays serialized; generation,
+// polling, and downloads can overlap up to the configured slot count.
 
 import { TaskStatus } from "./task-ledger.js";
 
 const ACTIVE_STATUSES = new Set([
   TaskStatus.submitting,
+  TaskStatus.generating,
+  TaskStatus.downloading
+]);
+
+const UNLOCKABLE_STATUSES = new Set([
   TaskStatus.generating,
   TaskStatus.downloading
 ]);
@@ -35,12 +39,12 @@ export function isOverlapActiveTask(task = {}) {
   return ACTIVE_STATUSES.has(task.status);
 }
 
-function getTaskStartedAtMs(task = {}) {
+function getTaskDelayBaseAtMs(task = {}) {
   const raw =
-    task.overlapStartedAt ||
     task.submittedAt ||
-    task.submitAttemptStartedAt ||
+    task.overlapStartedAt ||
     task.startedAt ||
+    task.submitAttemptStartedAt ||
     "";
 
   const parsed = Date.parse(raw);
@@ -124,14 +128,14 @@ export function createOverlapController({
       return { ok: false, reason: "unlock_consumed" };
     }
 
-    if (!isOverlapActiveTask(task)) {
-      return { ok: false, reason: "task_not_active" };
+    if (!UNLOCKABLE_STATUSES.has(task.status)) {
+      return { ok: false, reason: isOverlapActiveTask(task) ? "task_not_ready" : "task_not_active" };
     }
 
-    const startedAtMs = getTaskStartedAtMs(task);
+    const startedAtMs = getTaskDelayBaseAtMs(task);
 
     if (!Number.isFinite(startedAtMs)) {
-      return { ok: false, reason: "missing_started_at" };
+      return { ok: false, reason: "missing_delay_base" };
     }
 
     const elapsedSeconds = Math.max(0, (now() - startedAtMs) / 1000);

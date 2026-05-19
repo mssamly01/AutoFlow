@@ -3905,6 +3905,7 @@ function pumpOverlapQueue(tabId) {
   const totalActiveCount = activeTasks.length;
   const freeSlots = Math.max(0, config.maxConcurrentTasks - totalActiveCount);
   if (freeSlots <= 0) return;
+  if (activeSubmitRuns.size > 0) return;
 
   const tasks = overlapController.pickNextTasksToStart();
   if (!tasks.length) return;

@@ -1027,7 +1027,7 @@ export function renderSettings(root, state) {
 
     subheader("speed", "Overlap Queue"),
     field("Enable overlap:", controlGroup(checkInput("overlapEnabledCheckbox", presets.overlapEnabled, "overlapEnabled"))),
-    el("div", { class: "hint-text wide", text: "Start the next task before the current task fully completes. API can submit in parallel; DOM uses one protected composer slot." }),
+    el("div", { class: "hint-text wide", text: "Start the next task after the overlap delay. The limit caps active generating tasks, not instant submits." }),
     field("Max concurrent tasks:", controlGroup(numberInput("overlapMaxConcurrentTasks", presets.overlapMaxConcurrentTasks, "overlapMaxConcurrentTasks", { min: "1", max: "4" }))),
     field("Overlap delay (seconds):", controlGroup(numberInput("overlapDelaySeconds", presets.overlapDelaySeconds, "overlapDelaySeconds", { min: "5", max: "600" }))),
 

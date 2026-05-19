@@ -1080,7 +1080,7 @@ function buildStep3Body(state, prompts, refs, mode) {
       ? row(
           "speed",
           "Overlap",
-          "ON - DOM/API tasks start before previous completes",
+          "ON - starts are staggered by overlap delay",
           valSelect("overlapMaxConcurrentTasks", String(presets.overlapMaxConcurrentTasks || 2), overlapOptions)
         )
       : null,
