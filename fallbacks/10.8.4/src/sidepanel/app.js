@@ -3278,7 +3278,7 @@ function buildReferenceAliases(displayName = "") {
   const aliases = [clean];
 
   if (parts.length >= 2) aliases.push(parts.slice(-2).join(" "));
-  if (parts.length >= 2) aliases.push(parts.slice(1).join(" "));
+  if (parts.length >= 3) aliases.push(parts.slice(1).join(" "));
 
   return uniqueStrings(aliases);
 }
@@ -3901,31 +3901,6 @@ function queuePayloadSummary(jobs = []) {
   };
 }
 
-function showLocalPreparingQueue(prompts = []) {
-  const settings = taskSettingsForMode(state.control.mode);
-  const isImage = state.control.mode === FLOW_MODES.textToImage;
-  const expectedCount = Math.max(1, Number(settings.repeatCount || 1));
-  const jobId = `local-preparing-${Date.now()}`;
-  state.queue.running = true;
-  state.queue.items = prompts.map((prompt, index) => ({
-    id: `${jobId}-${index}`,
-    jobId,
-    jobIndex: index,
-    jobPromptCount: prompts.length,
-    jobTitle: queueBatchTitle(state.control.mode, prompts.length),
-    prompt,
-    mode: state.control.mode,
-    status: "pending",
-    submitPath: state.control.presets.submitPath,
-    submitPathPreference: state.control.presets.submitPath,
-    repeatCount: expectedCount,
-    expectedImages: isImage ? expectedCount : 0,
-    expectedVideos: isImage ? 0 : expectedCount,
-    download: settings.download || {},
-    localPreparing: true
-  }));
-}
-
 // T2I -> F2V autopilot follow-up (issue #208). Called from
 // applyRuntimePayload when the queue transitions running -> idle and
 // state.control.autopilotPendingBatch is set. Reads the just-finished T2I
@@ -4062,15 +4037,12 @@ async function enqueueAndRun() {
       await clearQueue({ renderAfter: false });
       appendLog("info", "queue", "Cleared the previous queue before starting a fresh Run.");
     }
-    state.ui.activeRoute = "live";
     state.ui.galleryTab = state.control.mode === FLOW_MODES.textToImage ? "images" : "videos";
-    showLocalPreparingQueue(prompts);
     appendLog("info", "queue", `Preparing ${prompts.length} prompt${prompts.length === 1 ? "" : "s"} for ${state.ui.galleryTab}.`);
-    render();
-    await nextAnimationFrame();
     const jobs = await buildJobs();
     const payloadSummary = queuePayloadSummary(jobs);
     appendLog("info", "diagnostics", `Job build complete: jobs=${payloadSummary.jobs} refs=${payloadSummary.refInputs} blobRefs=${payloadSummary.blobRefs} inlineRefs=${payloadSummary.inlineDataRefs} mediaIdRefs=${payloadSummary.mediaIdRefs} payloadBytes=${payloadSummary.approxPayloadBytes}.`);
+    state.ui.activeRoute = "live";
     const { added, jobId: queuedJobId } = await enqueueJobs(jobs);
     if (added > 0 && rememberRunSnapshot(historySnapshot)) {
       clearActiveRunDraft();
@@ -4091,9 +4063,9 @@ async function enqueueAndRun() {
       state.control.autopilotPendingBatch = null;
       appendLog("warn", "queue", "After Run skipped: every prompt line must use Auto Flow format with image prompt ||| video prompt.");
     }
+    appendLog("info", "queue", `Queue ready with ${added} task${added === 1 ? "" : "s"}. Press Play to start.`);
     await persistState();
     render();
-    appendLog("info", "queue", `Queue ready with ${added} task${added === 1 ? "" : "s"}. Press Play to start.`);
   } catch (error) {
     appendLog("error", "diagnostics", `Run failed before/around queue start: ${error.message}; ${compactRunDiagnosticText(runDiagnosticSummary())}.`);
     // Surface a user-visible explanation in the wizard step 3 banner so the
@@ -4203,19 +4175,6 @@ function modeHasAnyReference(currentState = state) {
       || splitIds(refs.omniRefRefs).length > 0;
   }
   return false;
-}
-
-function nextAnimationFrame() {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      resolve();
-    };
-    requestAnimationFrame(finish);
-    window.setTimeout(finish, 80);
-  });
 }
 
 function queueBatchTitle(mode, count = 0) {

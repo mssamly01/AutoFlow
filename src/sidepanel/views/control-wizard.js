@@ -1178,7 +1178,7 @@ function effectiveRefIdsForPrompt(state, prompt, index, totalPrompts) {
         displayName,
         cleanFromFile,
         fileName
-      ].flatMap(v => String(v || "").split(/[\s,;]+/)).map(v => v.trim().toLowerCase()).filter(Boolean))];
+      ].flatMap((value) => Array.isArray(value) ? value : String(value || "").split(/[;,]+/)).map((value) => String(value || "").trim()).filter(Boolean))];
 
       return {
         ...item,

@@ -1514,6 +1514,7 @@ function renderGalleryHowTo(active, locale = "en") {
 
 function renderLiveQueueGallery(state, selected = new Set(), options = {}) {
   const locale = state.control?.presets?.language || "en";
+  const referenceLookup = buildLiveQueueReferenceLookup(state);
   const allGroups = queueGroups(state.queue.items, { queueRunning: state.queue?.running === true, locale });
   const activeGroups = allGroups.filter((group) => group.statusClass !== "done");
   const groups = options.showAllGroups
@@ -1533,7 +1534,7 @@ function renderLiveQueueGallery(state, selected = new Set(), options = {}) {
           el("span", { class: "q-status", text: group.statusLabel })
         ),
         el("div", { class: "live-queue-task-list" },
-          group.items.map((item, index) => renderLiveQueueTaskRow(item, index, selected, { queueRunning: group.queueRunning }, locale))
+          group.items.map((item, index) => renderLiveQueueTaskRow(item, index, selected, { queueRunning: group.queueRunning, referenceLookup }, locale))
         )
       ))
       : el("div", { class: "gallery-empty", text: translate("noLiveQueueItems", {}, locale) })
@@ -1685,7 +1686,7 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
   const label = liveQueueStatusLabel(item, options);
   const prompt = String(item.prompt || item.id || "Untitled task");
   const { resultCount, expectedCount } = liveQueueProgress(item);
-  const thumb = liveQueueTaskThumb(item, locale);
+  const thumb = liveQueueTaskThumb(item, locale, options);
   const canRegenerate = Boolean(item?.id) && [
     "complete",
     "done",
@@ -1739,8 +1740,8 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
   );
 }
 
-function liveQueueTaskThumb(item = {}, locale = "en") {
-  const refPreviews = liveQueueInputReferencePreviews(item);
+function liveQueueTaskThumb(item = {}, locale = "en", options = {}) {
+  const refPreviews = liveQueueInputReferencePreviews(item, options);
   if (refPreviews.length > 1) {
     const visibleRefs = refPreviews.slice(0, 3);
     const groupId = liveQueueReferenceGroupId(item);
@@ -1772,7 +1773,7 @@ function liveQueueTaskThumb(item = {}, locale = "en") {
     );
   }
   if (item.mode === FLOW_MODES.textToImage && !refPreviews.length) return null;
-  const preview = liveQueuePrimaryPreview(item);
+  const preview = liveQueuePrimaryPreview(item, options);
   if (preview.src) {
     const groupId = liveQueueReferenceGroupId(item);
     return el("button", {
@@ -1797,37 +1798,90 @@ function liveQueueReferenceGroupId(item = {}) {
   return `refs:${String(item.id || item.jobId || item.batchId || item.prompt || "task").replace(/\s+/g, "-")}`;
 }
 
-function liveQueuePrimaryPreview(item = {}) {
-  return liveQueueInputPreview(item);
+function liveQueuePrimaryPreview(item = {}, options = {}) {
+  return liveQueueInputPreview(item, options);
 }
 
-function liveQueueInputReferencePreviews(item = {}) {
+function buildLiveQueueReferenceLookup(state = {}) {
+  const lookup = new Map();
+  [
+    ...(state.control?.transientReferenceItems || []),
+    ...(state.referenceLibrary?.savedItems || [])
+  ].forEach((ref) => {
+    for (const key of liveQueueReferenceLookupKeys(ref)) {
+      if (!lookup.has(key)) lookup.set(key, ref);
+    }
+  });
+  return lookup;
+}
+
+function liveQueueReferenceLookupKeys(ref = {}) {
+  return [
+    ref?.id,
+    ref?.blobStoreId,
+    ref?.mediaId,
+    ref?.assetImageId,
+    ref?.imageUrl,
+    ref?.dataUrl,
+    ref?.mediaUrl
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+function liveQueueResolveReference(ref = {}, lookup = null) {
+  const match = liveQueueReferenceLookupKeys(ref)
+    .map((key) => lookup?.get?.(key))
+    .find(Boolean);
+  if (!match) return ref || {};
+  return {
+    ...match,
+    ...ref,
+    imageUrl: ref?.imageUrl || match.imageUrl || match.mediaUrl || match.dataUrl || "",
+    dataUrl: ref?.dataUrl || match.dataUrl || "",
+    mediaUrl: ref?.mediaUrl || match.mediaUrl || match.imageUrl || ""
+  };
+}
+
+function liveQueueInputReferencePreviews(item = {}, options = {}) {
+  const lookup = options.referenceLookup || null;
   const refs = []
     .concat(Array.isArray(item.refInputs) ? item.refInputs : [])
     .concat(item.startRefInput ? [item.startRefInput] : [])
-    .concat(item.endRefInput ? [item.endRefInput] : []);
+    .concat(item.endRefInput ? [item.endRefInput] : [])
+    .concat(
+      [
+        ...(Array.isArray(item.refMediaIds) ? item.refMediaIds : []),
+        item.startMediaId,
+        item.endMediaId
+      ]
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+        .map((mediaId) => ({ id: mediaId, mediaId }))
+    );
   const seen = new Set();
   return refs
     .map((ref, index) => {
-      const src = ref?.imageUrl || ref?.dataUrl || ref?.mediaUrl || "";
-      const previewUrl = ref?.dataUrl || ref?.mediaUrl || ref?.imageUrl || "";
+      const resolved = liveQueueResolveReference(ref, lookup);
+      const mediaId = String(resolved?.mediaId || resolved?.assetImageId || ref?.mediaId || ref?.assetImageId || ref?.id || "").trim();
+      const src = resolved?.imageUrl || resolved?.dataUrl || resolved?.mediaUrl || (mediaId ? buildMediaRedirectUrl({ mediaId }) : "");
+      const previewUrl = resolved?.dataUrl || resolved?.mediaUrl || resolved?.imageUrl || src;
       const id = String(ref?.mediaId || ref?.assetImageId || ref?.id || ref?.blobStoreId || src || `${index}`).trim();
-      if (!src || seen.has(id)) return null;
+      if (!src || seen.has(id) || seen.has(src)) return null;
       seen.add(id);
+      seen.add(src);
       return {
         src,
         previewUrl,
         kind: "images",
         mediaId: id,
         galleryId: id,
-        title: String(ref?.title || ref?.fileName || item.prompt || item.id || "Input reference")
+        title: String(resolved?.title || resolved?.fileName || ref?.title || ref?.fileName || item.prompt || item.id || "Input reference")
       };
     })
     .filter(Boolean);
 }
 
-function liveQueueInputPreview(item = {}) {
-  const refPreview = liveQueueInputReferencePreviews(item).find((preview) => preview.src);
+function liveQueueInputPreview(item = {}, options = {}) {
+  const refPreview = liveQueueInputReferencePreviews(item, options).find((preview) => preview.src);
   const refSrc = refPreview?.src || "";
   const src = refSrc || item.imageUrl || item.thumbnailUrl || "";
   return {

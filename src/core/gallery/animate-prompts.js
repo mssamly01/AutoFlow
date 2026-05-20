@@ -3,7 +3,10 @@ const IMAGE_HINT_RE = /\b(image|still|photo|photograph|portrait|poster|reference
 const REFERENCE_MATCH_STOPWORDS = new Set([
   "image", "img", "photo", "picture", "reference", "ref", "product", "shot",
   "still", "frame", "start", "end", "match", "test", "proof", "verify",
-  "matrix", "sample", "upload", "prompt"
+  "matrix", "sample", "upload", "prompt",
+  "room", "bedroom", "apartment", "cafe", "villa", "terminal", "cabin", "bar",
+  "house", "home", "office", "school", "street", "city", "kitchen", "garden",
+  "campus", "background", "interior", "exterior", "place", "setting"
 ]);
 
 export function sceneTag(value = "") {
@@ -248,7 +251,6 @@ function phraseContainmentScore(left = "", right = "") {
   if (!a || !b) return 0;
   if (a === b) return 120;
   if (` ${a} `.includes(` ${b} `)) return 80;
-  if (` ${b} `.includes(` ${a} `)) return 70;
   return 0;
 }
 
@@ -426,6 +428,7 @@ function effectiveCharacterIndex(promptText = "", imageName = "", fallbackIndex 
 
 export function promptMatchesReferenceItem(prompt = "", item = {}) {
   const imageName = autoMatchImageBaseName(item);
+  if (REFERENCE_MATCH_STOPWORDS.has(imageName)) return false;
   return promptContainsAutoMatchName(prompt, imageName);
 }
 
