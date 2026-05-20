@@ -114,6 +114,7 @@ let queueStartingTaskId = "";
 let overlapTimerId = null;
 let overlapLastTaskStartedAtMs = 0;
 let overlapLastTaskStartedId = "";
+let overlapStartedTaskCount = 0;
 let overlapReachedMaxConcurrent = false;
 let overlapNextStartAllowedAtMs = 0;
 let overlapNextStartDelaySeconds = 0;
@@ -3972,6 +3973,7 @@ function filterOverlapTasksForSubmitSlots(tasks = [], freeSlots = 0) {
 function resetOverlapStartPace() {
   overlapLastTaskStartedAtMs = 0;
   overlapLastTaskStartedId = "";
+  overlapStartedTaskCount = 0;
   overlapReachedMaxConcurrent = false;
   overlapNextStartAllowedAtMs = 0;
   overlapNextStartDelaySeconds = 0;
@@ -4053,9 +4055,30 @@ function overlapRefillWaitMs(config = {}) {
   return Math.max(0, (overlapRefillReadyTimesMs[0] || 0) - Date.now());
 }
 
+function syncOverlapStartedCountFromLedger(config = {}) {
+  const maxConcurrent = Math.max(1, Number(config.maxConcurrentTasks || 1) || 1);
+  const startedCount = ledger
+    .listTasks()
+    .filter((task) => (
+      task.overlapStartedAt ||
+      task.submitAttemptStartedAt ||
+      task.submittedAt ||
+      [TaskStatus.submitting, TaskStatus.generating, TaskStatus.downloading, TaskStatus.complete].includes(task.status)
+    ))
+    .length;
+  overlapStartedTaskCount = Math.max(overlapStartedTaskCount, Math.min(startedCount, maxConcurrent));
+  if (overlapStartedTaskCount >= maxConcurrent || overlapController.getActiveTasks().length >= maxConcurrent) {
+    overlapReachedMaxConcurrent = true;
+  }
+}
+
 function markOverlapTaskStarted(taskId, config = {}, options = {}) {
   overlapLastTaskStartedAtMs = Date.now();
   overlapLastTaskStartedId = String(taskId || "");
+  overlapStartedTaskCount += 1;
+  if (overlapStartedTaskCount >= Math.max(1, Number(config.maxConcurrentTasks || 1) || 1)) {
+    overlapReachedMaxConcurrent = true;
+  }
   if (options.refillMode) {
     consumeOverlapRefillDelay();
   } else {
@@ -4074,6 +4097,7 @@ function pumpOverlapQueue(tabId) {
   if (!config.enabled) return;
 
   startOverlapTimer(tabId);
+  syncOverlapStartedCountFromLedger(config);
 
   // Proactively check if any active task should unlock the next one.
   const activeTasks = overlapController.getActiveTasks();

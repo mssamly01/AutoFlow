@@ -4388,13 +4388,15 @@ async function enqueueAndRun() {
       await clearQueue({ renderAfter: false });
       appendLog("info", "queue", "Cleared the previous queue before starting a fresh Run.");
     }
+    state.ui.activeRoute = "live";
     state.ui.galleryTab = state.control.mode === FLOW_MODES.textToImage ? "images" : "videos";
     const preparingPrompts = jobPromptLinesForRun();
     appendLog("info", "queue", `Preparing ${preparingPrompts.length} prompt${preparingPrompts.length === 1 ? "" : "s"} for ${state.ui.galleryTab}.`);
+    await persistState();
+    render();
     const jobs = await buildJobs();
     const payloadSummary = queuePayloadSummary(jobs);
     appendLog("info", "diagnostics", `Job build complete: jobs=${payloadSummary.jobs} refs=${payloadSummary.refInputs} blobRefs=${payloadSummary.blobRefs} inlineRefs=${payloadSummary.inlineDataRefs} mediaIdRefs=${payloadSummary.mediaIdRefs} payloadBytes=${payloadSummary.approxPayloadBytes}.`);
-    state.ui.activeRoute = "live";
     const { added, jobId: queuedJobId } = await enqueueJobs(jobs);
     if (added > 0 && rememberRunSnapshot(historySnapshot)) {
       clearActiveRunDraft();
