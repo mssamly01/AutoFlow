@@ -115,6 +115,10 @@ let overlapTimerId = null;
 let overlapLastTaskStartedAtMs = 0;
 let overlapLastTaskStartedId = "";
 let overlapReachedMaxConcurrent = false;
+let overlapNextStartAllowedAtMs = 0;
+let overlapNextStartDelaySeconds = 0;
+let overlapRefillReadyTimesMs = [];
+let overlapRefillDelaySeconds = 0;
 const overlapController = createOverlapController({
   ledger,
   scheduler,
@@ -134,6 +138,58 @@ function logOverlapSubmit(event, taskId, extra = {}) {
     at: new Date().toISOString(),
     ...extra
   });
+}
+
+function compactErrorText(value, fallback = "UNKNOWN_ERROR") {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value instanceof Error) {
+    return value.message || String(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => compactErrorText(entry, "")).filter(Boolean).join(" ");
+  }
+  if (typeof value === "object") {
+    const parts = [
+      value.code,
+      value.reason,
+      value.status,
+      value.statusText,
+      value.message,
+      value.error,
+      value.failure,
+      value.details,
+      value.data?.error,
+      value.data?.message,
+      value.data?.status,
+      value.data?.reason
+    ].map((entry) => compactErrorText(entry, "")).filter(Boolean);
+
+    if (parts.length) return [...new Set(parts)].join(" ");
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value || fallback);
+    }
+  }
+  return String(value || fallback);
+}
+
+function overlapFailureTextFromResult(result = {}) {
+  const text = compactErrorText([
+    result?.lastError,
+    result?.failureClass,
+    result?.healAction,
+    result?.error,
+    result?.statusText,
+    result?.data?.error,
+    result?.data?.message,
+    result?.data?.status,
+    result?.data?.reason
+  ], "");
+  return text || "OVERLAP_SUBMIT_FAILED";
 }
 
 function recordEvent(event) {
@@ -3845,11 +3901,17 @@ function startTaskWatcher(taskId, tabId) {
       logOverlapSubmit("OUTPUT_DONE", taskId);
       await persistQueueState();
     } catch (error) {
-      console.error("[AutoFlow][OverlapWatch] failed", taskId, error);
+      const errorText = compactErrorText(error, "OVERLAP_WATCH_FAILED");
+      console.warn("[AutoFlow][OverlapWatch] failed", {
+        taskId,
+        error: errorText,
+        stack: error?.stack || ""
+      });
       scheduler.markFailure(taskId, error);
       await persistQueueState();
     } finally {
       activeWatchRuns.delete(taskId);
+      scheduleOverlapRefillDelay(overlapController.getConfig(), taskId, "task_settled");
       pumpOverlapQueue(tabId);
       stopOverlapTimerIfIdle();
     }
@@ -3911,6 +3973,10 @@ function resetOverlapStartPace() {
   overlapLastTaskStartedAtMs = 0;
   overlapLastTaskStartedId = "";
   overlapReachedMaxConcurrent = false;
+  overlapNextStartAllowedAtMs = 0;
+  overlapNextStartDelaySeconds = 0;
+  overlapRefillReadyTimesMs = [];
+  overlapRefillDelaySeconds = 0;
 }
 
 function taskOverlapStartMs(task = {}) {
@@ -3929,17 +3995,72 @@ function latestActiveOverlapStartMs() {
     .reduce((latest, task) => Math.max(latest, taskOverlapStartMs(task)), 0);
 }
 
-function overlapStartPaceWaitMs(config = {}) {
-  const delayMs = Math.max(0, Number(config.delaySeconds || 0) * 1000);
-  if (!delayMs) return 0;
-  const latestStartedAtMs = Math.max(overlapLastTaskStartedAtMs, latestActiveOverlapStartMs());
-  if (!latestStartedAtMs) return 0;
-  return Math.max(0, latestStartedAtMs + delayMs - Date.now());
+function randomSecondsBetween(minSeconds = 0, maxSeconds = minSeconds) {
+  const min = Math.max(0, Math.ceil(Number(minSeconds || 0)));
+  const max = Math.max(min, Math.floor(Number(maxSeconds || min) || min));
+  if (max <= min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
 }
 
-function markOverlapTaskStarted(taskId) {
+function scheduleOverlapNextStartDelay(config = {}, baseAtMs = Date.now()) {
+  const delaySeconds = randomSecondsBetween(config.delayMinSeconds, config.delayMaxSeconds);
+  overlapNextStartDelaySeconds = delaySeconds;
+  overlapNextStartAllowedAtMs = Number(baseAtMs || Date.now()) + (delaySeconds * 1000);
+  return delaySeconds;
+}
+
+function scheduleOverlapRefillDelay(config = {}, taskId = "", reason = "completion") {
+  if (!overlapReachedMaxConcurrent) return 0;
+  if (typeof scheduler.nextPendingTasks === "function" && !scheduler.nextPendingTasks(1).length) return 0;
+  const delaySeconds = randomSecondsBetween(config.completionDelayMinSeconds, config.completionDelayMaxSeconds);
+  overlapRefillDelaySeconds = delaySeconds;
+  overlapRefillReadyTimesMs = [
+    ...overlapRefillReadyTimesMs,
+    Date.now() + (delaySeconds * 1000)
+  ]
+    .filter((time) => Number.isFinite(time))
+    .sort((a, b) => a - b);
+  logOverlapSubmit("REFILL_DELAY", taskId, {
+    reason,
+    delaySeconds,
+    completionDelayMinSeconds: config.completionDelayMinSeconds,
+    completionDelayMaxSeconds: config.completionDelayMaxSeconds
+  });
+  return delaySeconds;
+}
+
+function consumeOverlapRefillDelay() {
+  overlapRefillReadyTimesMs = overlapRefillReadyTimesMs.slice(1);
+}
+
+function overlapStartPaceWaitMs(config = {}) {
+  const latestStartedAtMs = Math.max(overlapLastTaskStartedAtMs, latestActiveOverlapStartMs());
+  if (!latestStartedAtMs) return 0;
+  if (!overlapNextStartAllowedAtMs || overlapNextStartAllowedAtMs < latestStartedAtMs) {
+    scheduleOverlapNextStartDelay(config, latestStartedAtMs);
+  }
+  return Math.max(0, overlapNextStartAllowedAtMs - Date.now());
+}
+
+function overlapRefillWaitMs(config = {}) {
+  if (!overlapReachedMaxConcurrent) return 0;
+  overlapRefillReadyTimesMs = overlapRefillReadyTimesMs
+    .filter((time) => Number.isFinite(time))
+    .sort((a, b) => a - b);
+  if (!overlapRefillReadyTimesMs.length) {
+    scheduleOverlapRefillDelay(config, "", "slot_available");
+  }
+  return Math.max(0, (overlapRefillReadyTimesMs[0] || 0) - Date.now());
+}
+
+function markOverlapTaskStarted(taskId, config = {}, options = {}) {
   overlapLastTaskStartedAtMs = Date.now();
   overlapLastTaskStartedId = String(taskId || "");
+  if (options.refillMode) {
+    consumeOverlapRefillDelay();
+  } else {
+    scheduleOverlapNextStartDelay(config, overlapLastTaskStartedAtMs);
+  }
   clearQueueStartingTask(taskId);
 }
 
@@ -3975,12 +4096,15 @@ function pumpOverlapQueue(tabId) {
   if (!refillMode) {
     const waitMs = overlapStartPaceWaitMs(config);
     if (waitMs > 0) return;
+  } else {
+    const waitMs = overlapRefillWaitMs(config);
+    if (waitMs > 0) return;
   }
 
-  const tasks = overlapController.pickNextTasksToStart(refillMode ? freeSlots : 1);
+  const tasks = overlapController.pickNextTasksToStart(1);
   if (!tasks.length) return;
 
-  const tasksToStart = filterOverlapTasksForSubmitSlots(tasks, freeSlots);
+  const tasksToStart = filterOverlapTasksForSubmitSlots(tasks, 1);
   if (!tasksToStart.length) return;
 
   let startedCount = 0;
@@ -3988,13 +4112,19 @@ function pumpOverlapQueue(tabId) {
     if (activeSubmitRuns.has(task.id) || activeWatchRuns.has(task.id)) continue;
 
     const previousTaskId = overlapLastTaskStartedId;
-    markOverlapTaskStarted(task.id);
+    markOverlapTaskStarted(task.id, config, { refillMode });
     startedCount += 1;
     if (totalActiveCount + startedCount >= config.maxConcurrentTasks) {
       overlapReachedMaxConcurrent = true;
     }
     logOverlapSubmit("SUBMIT_START", task.id, {
-      delaySeconds: config.delaySeconds,
+      delayMinSeconds: config.delayMinSeconds,
+      delayMaxSeconds: config.delayMaxSeconds,
+      selectedStartDelaySeconds: overlapNextStartDelaySeconds,
+      completionDelayMinSeconds: config.completionDelayMinSeconds,
+      completionDelayMaxSeconds: config.completionDelayMaxSeconds,
+      selectedRefillDelaySeconds: overlapRefillDelaySeconds,
+      pendingRefillDelays: overlapRefillReadyTimesMs.length,
       maxConcurrentTasks: config.maxConcurrentTasks,
       previousTaskId,
       refillMode
@@ -4002,6 +4132,7 @@ function pumpOverlapQueue(tabId) {
 
     const executor = createExecutorForTab(tabId);
     const runPromise = (async () => {
+      let shouldDelayAfterImmediateComplete = false;
       try {
         // Không markSubmitting ở đây.
         // executor.runTask() yêu cầu task còn pending và sẽ tự markSubmitting.
@@ -4014,12 +4145,7 @@ function pumpOverlapQueue(tabId) {
         const status = String(result?.status || "").toLowerCase();
 
         if (status === TaskStatus.failed || status === "failed") {
-          throw new Error(
-            result?.lastError ||
-            result?.failureClass ||
-            result?.healAction ||
-            "OVERLAP_SUBMIT_FAILED"
-          );
+          throw new Error(overlapFailureTextFromResult(result));
         }
 
         logOverlapSubmit("SUBMIT_DONE", task.id, {
@@ -4033,25 +4159,29 @@ function pumpOverlapQueue(tabId) {
         } else if (result?.status === TaskStatus.complete) {
           await sleep(250);
           await autoDownloadCompletedTasks([task.id], "overlap_immediate_complete");
+          shouldDelayAfterImmediateComplete = true;
         }
 
         await persistQueueState();
       } catch (error) {
-        console.error("[AutoFlow][OverlapSubmit] failed", {
+        const errorText = compactErrorText(error, "OVERLAP_SUBMIT_FAILED");
+        console.warn("[AutoFlow][OverlapSubmit] failed", {
           taskId: task.id,
-          error,
-          message: error?.message,
+          error: errorText,
           stack: error?.stack
         });
 
         logOverlapSubmit("SUBMIT_FAILED", task.id, {
-          error: String(error?.message || error)
+          error: errorText
         });
 
         scheduler.markFailure(task.id, error);
         await persistQueueState();
       } finally {
         activeSubmitRuns.delete(task.id);
+        if (shouldDelayAfterImmediateComplete) {
+          scheduleOverlapRefillDelay(overlapController.getConfig(), task.id, "task_complete");
+        }
         pumpOverlapQueue(tabId);
         stopOverlapTimerIfIdle();
       }
@@ -4333,6 +4463,102 @@ async function runQueueUntilIdle(preferredTabId) {
       });
     }
   }
+}
+
+function runSingleQueueTask(taskId, preferredTabId) {
+  if (runtimeState.queueRunning) return false;
+  const runToken = Number(runtimeState.queueRunToken || 0) + 1;
+  runtimeState.queueRunToken = runToken;
+  runtimeState.queueRunning = true;
+  queueStartingTaskId = String(taskId || "");
+  startBackgroundDownloadDaemon();
+  recordEvent({ type: "queue.task.play", runToken, taskId });
+
+  (async () => {
+    const isActiveRun = () => runtimeState.queueRunning && runtimeState.queueRunToken === runToken;
+    try {
+      await queueReady;
+      const tab = await findFlowTab(preferredTabId);
+      if (!tab?.id) throw new Error("flow_tab_not_found");
+
+      let task = ledger.getTask(taskId);
+      if (!task) throw new Error(`Unknown task id: ${taskId}`);
+      if (task.status !== TaskStatus.pending) {
+        recordEvent({ type: "queue.task.play_skip", taskId, status: task.status || "" });
+        return;
+      }
+
+      const continuity = await resolveContinuityChainForTask(task, tab.id);
+      if (continuity.waiting || continuity.blocked) return;
+
+      task = continuity.task || ledger.getTask(taskId) || task;
+      await ensureTaskProjectId(task, tab.id);
+      await persistQueueState();
+      if (!isActiveRun()) return;
+
+      const executor = createExecutorForTab(tab.id);
+      const taskToRun = ledger.getTask(taskId) || task;
+      const submitOnlyVideos = taskMediaKind(taskToRun) === "videos";
+      let resultTask = await executor.runTask(taskToRun.id, { submitOnlyVideos });
+      if (!isActiveRun()) return;
+
+      if (!submitOnlyVideos && taskMediaKind(resultTask) === "images" && resultTask?.status !== TaskStatus.generating && resultTask?.status !== TaskStatus.complete) {
+        resultTask = await recoverImageTaskAfterSubmitFailure(resultTask, tab.id, "single_task_after_submit_result");
+      }
+      if (!isActiveRun()) return;
+
+      resultTask = taskMediaKind(resultTask) === "videos"
+        ? await waitForVideoTaskOutputs(resultTask, tab.id)
+        : await waitForImageTaskOutputs(resultTask, tab.id);
+      if (!isActiveRun()) return;
+
+      recordEvent({
+        type: "queue.task.play_done",
+        taskId: resultTask?.id || taskId,
+        status: resultTask?.status || "unknown",
+        failureClass: resultTask?.failureClass || "",
+        failureScope: resultTask?.failureScope || "",
+        mediaIds: resultTask?.mediaIds || []
+      });
+
+      if (resultTask?.status === TaskStatus.complete) {
+        if (resultTask.retryOfTaskId) {
+          resultTask = await mergeVideoRepairTaskIntoParent(resultTask) || resultTask;
+          if (resultTask?.partialFailure === true) {
+            await appendVideoRepairTask(resultTask, "single_task_video_repair_still_partial");
+          }
+        } else {
+          await appendVideoRepairTask(resultTask, "single_task_complete_partial");
+        }
+        await autoDownloadCompletedTasks([resultTask.id], "single_task_complete");
+      }
+      await persistQueueState();
+    } catch (error) {
+      if (runtimeState.queueRunToken === runToken && ledger.getTask(taskId)) {
+        const task = scheduler.markBlocked(taskId, error);
+        await persistQueueState();
+        recordEvent({
+          type: "queue.task.play_error",
+          taskId,
+          error: String(error?.message || error || "queue_task_play_failed"),
+          failureClass: task?.failureClass || "",
+          failureScope: task?.failureScope || "",
+          healAction: task?.healAction || ""
+        });
+      }
+    } finally {
+      stopOverlapTimerIfIdle();
+      clearQueueStartingTask(taskId);
+      await releaseDebuggerSessions("single_task_finished", recordDebuggerTrace);
+      if (runtimeState.queueRunToken === runToken) {
+        runtimeState.queueRunning = false;
+        await persistQueueState();
+        recordEvent({ type: "queue.task.play_stop", runToken, taskId });
+      }
+    }
+  })();
+
+  return true;
 }
 
 function generationSubmitWaitMs(task = {}) {
@@ -5156,6 +5382,77 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         queueRunning: runtimeState.queueRunning,
         startedTaskId: next?.id || "",
         queue: queueState(),
+        auth: runtimeState.auth
+      }));
+    })();
+    return true;
+  }
+
+  if (message.type === MessageType.QueueStartTask) {
+    (async () => {
+      await queueReady;
+      captureAuthEnvironment(message.payload || {});
+      if (message.payload?.presets && typeof message.payload.presets === "object") {
+        runtimeState.overlapPresets = message.payload.presets;
+      }
+      const taskId = compactString(message.payload?.id || message.payload?.taskId);
+      const task = taskId ? ledger.getTask(taskId) : null;
+      if (!task) {
+        sendResponse(createMessage(MessageType.QueueStartTask, {
+          ok: false,
+          error: taskId ? `Unknown task id: ${taskId}` : "Missing task id",
+          queueRunning: runtimeState.queueRunning,
+          queue: queueState(),
+          gallery: galleryState()
+        }));
+        return;
+      }
+      if (runtimeState.queueRunning) {
+        sendResponse(createMessage(MessageType.QueueStartTask, {
+          ok: false,
+          error: "queue_already_running",
+          queueRunning: runtimeState.queueRunning,
+          queue: queueState(),
+          gallery: galleryState()
+        }));
+        return;
+      }
+      if (task.status !== TaskStatus.pending) {
+        sendResponse(createMessage(MessageType.QueueStartTask, {
+          ok: false,
+          error: `Task is ${task.status || "not pending"}`,
+          queueRunning: runtimeState.queueRunning,
+          queue: queueState(),
+          gallery: galleryState()
+        }));
+        return;
+      }
+
+      const access = await validateQueueStartAccess(task);
+      if (!access.allowed) {
+        scheduler.markBlocked(task.id, access.reason || access.error || "license_required");
+        const auth = await updateAuthState();
+        await persistQueueState();
+        sendResponse(createMessage(MessageType.QueueStartTask, {
+          ok: false,
+          error: access.reason || access.error || "license_required",
+          access,
+          queueRunning: runtimeState.queueRunning,
+          queue: queueState(),
+          gallery: galleryState(),
+          auth
+        }));
+        return;
+      }
+
+      const started = runSingleQueueTask(task.id, Number(message.payload?.tabId || sender?.tab?.id || 0) || undefined);
+      sendResponse(createMessage(MessageType.QueueStartTask, {
+        ok: started,
+        access,
+        startedTaskId: started ? task.id : "",
+        queueRunning: runtimeState.queueRunning,
+        queue: queueState(),
+        gallery: galleryState(),
         auth: runtimeState.auth
       }));
     })();

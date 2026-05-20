@@ -54,6 +54,28 @@ function readFileDataUrl(file) {
   });
 }
 
+async function copyTextToClipboard(text = "") {
+  const value = String(text || "");
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    textarea.remove();
+  }
+}
+
 export function createGalleryController(deps) {
   const {
     getState,
@@ -197,7 +219,12 @@ export function createGalleryController(deps) {
       }
     });
     root.querySelector("#liveQueueResumeBtn")?.addEventListener("click", async () => {
-      await deps.resumeQueue();
+      const command = String(root.querySelector("#liveQueueResumeBtn")?.dataset.liveQueueCommand || "resume");
+      if (command === "play" && typeof deps.runQueue === "function") {
+        await deps.runQueue();
+      } else {
+        await deps.resumeQueue();
+      }
     });
     root.querySelector("#liveQueueStopBtn")?.addEventListener("click", async () => {
       await deps.stopQueue();
@@ -295,6 +322,62 @@ export function createGalleryController(deps) {
       button.remove();
     });
   });
+    root.querySelectorAll("[data-live-copy-prompt]").forEach((button) => {
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const prompt = String(button.dataset.liveCopyPrompt || "");
+        if (!prompt) return;
+        const icon = button.querySelector(".material-symbols-outlined");
+        const previousIcon = icon?.textContent || "content_copy";
+        const previousTitle = button.getAttribute("title") || "Copy prompt";
+        button.disabled = true;
+        try {
+          await copyTextToClipboard(prompt);
+          if (icon) icon.textContent = "check";
+          button.setAttribute("title", "Copied prompt");
+          appendLog?.("info", "queue", "Prompt copied.");
+          window.setTimeout(() => {
+            if (icon) icon.textContent = previousIcon;
+            button.setAttribute("title", previousTitle);
+            button.disabled = false;
+          }, 900);
+        } catch (error) {
+          button.disabled = false;
+          appendLog?.("warn", "queue", `Could not copy prompt: ${error.message || error}`);
+        }
+      });
+    });
+    root.querySelectorAll("[data-live-play-task-id]").forEach((button) => {
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const taskId = String(button.dataset.livePlayTaskId || "").trim();
+        if (!taskId || typeof deps.playQueueTask !== "function") return;
+        if (button.disabled) return;
+        button.disabled = true;
+        try {
+          await deps.playQueueTask(taskId);
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+    root.querySelectorAll("[data-live-stop-queue]").forEach((button) => {
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof deps.stopQueue !== "function") return;
+        if (button.disabled) return;
+        button.disabled = true;
+        try {
+          await deps.stopQueue();
+          render();
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
     root.querySelectorAll("[data-live-regenerate-task-id]").forEach((button) => {
       button.addEventListener("click", async (event) => {
         event.preventDefault();

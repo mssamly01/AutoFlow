@@ -1027,9 +1027,18 @@ export function renderSettings(root, state) {
 
     subheader("speed", "Overlap Queue"),
     field("Enable overlap:", controlGroup(checkInput("overlapEnabledCheckbox", presets.overlapEnabled, "overlapEnabled"))),
-    el("div", { class: "hint-text wide", text: "Start the next task after the overlap delay. The limit caps active generating tasks, not instant submits." }),
+    el("div", { class: "hint-text wide", text: "Starts are staggered by a random overlap delay. After the queue reaches max concurrency, completed tasks wait for the task delay before the next task starts." }),
     field("Max concurrent tasks:", controlGroup(numberInput("overlapMaxConcurrentTasks", presets.overlapMaxConcurrentTasks, "overlapMaxConcurrentTasks", { min: "1", max: "4" }))),
-    field("Overlap delay (seconds):", controlGroup(numberInput("overlapDelaySeconds", presets.overlapDelaySeconds, "overlapDelaySeconds", { min: "5", max: "600" }))),
+    field("Overlap delay (sec):", controlGroup(
+      numberInput("overlapDelayMinSeconds", presets.overlapDelayMinSeconds, "overlapDelayMinSeconds", { min: "5", max: "600" }),
+      el("span", { text: "to" }),
+      numberInput("overlapDelayMaxSeconds", presets.overlapDelayMaxSeconds, "overlapDelayMaxSeconds", { min: "5", max: "600" })
+    )),
+    field("Task delay (sec):", controlGroup(
+      numberInput("overlapCompletionDelayMinSeconds", presets.overlapCompletionDelayMinSeconds, "overlapCompletionDelayMinSeconds", { min: "0", max: "600" }),
+      el("span", { text: "to" }),
+      numberInput("overlapCompletionDelayMaxSeconds", presets.overlapCompletionDelayMaxSeconds, "overlapCompletionDelayMaxSeconds", { min: "0", max: "600" })
+    )),
 
     subheader("download", "Download Settings"),
     field("Auto-download videos:", controlGroup(checkInput("autoDownloadCheckbox", presets.autoDownload, "autoDownload"))),
@@ -1537,15 +1546,20 @@ function renderLiveQueueManager(state, locale = "en") {
   const items = visibleQueueItems(state.queue.items || []);
   const doneCount = items.filter((item) => ["complete", "done", "failed", "blocked", "download_failed", "download_incomplete"].includes(liveQueueEffectiveStatus(item))).length;
   const blockedCount = items.filter((item) => ["failed", "blocked", "download_failed"].includes(liveQueueEffectiveStatus(item))).length;
+  const pendingCount = items.filter((item) => liveQueueEffectiveStatus(item, { queueRunning: false }) === "pending").length;
   const incompleteDownloadCount = items.filter((item) => liveQueueEffectiveStatus(item) === "download_incomplete").length;
   const openCount = Math.max(0, items.length - doneCount);
+  const primaryMode = !blockedCount && pendingCount > 0 ? "play" : "resume";
+  const primaryDisabled = state.queue.running || (primaryMode === "play" ? pendingCount <= 0 : blockedCount <= 0);
+  const primaryTitle = primaryMode === "play" ? "Play pending tasks" : "Resume blocked or failed tasks";
+  const primaryLabel = primaryMode === "play" ? "Play" : translate("resume", {}, locale);
   return el("div", { class: "live-queue-manager" },
     el("div", { class: "live-queue-manager-copy" },
       el("strong", { text: translate("queueManager", {}, locale) }),
       el("span", { text: `${items.length} total - ${openCount} active - ${doneCount} finished${blockedCount ? ` - ${blockedCount} need attention` : ""}${incompleteDownloadCount ? ` - ${incompleteDownloadCount} missing download` : ""}` })
     ),
     el("div", { class: "live-queue-manager-actions" },
-      el("button", { id: "liveQueueResumeBtn", attrs: { type: "button", disabled: blockedCount ? null : "disabled", title: "Resume blocked or failed tasks" } }, icon("play_arrow"), el("span", { text: translate("resume", {}, locale) })),
+      el("button", { id: "liveQueueResumeBtn", data: { liveQueueCommand: primaryMode }, attrs: { type: "button", disabled: primaryDisabled ? "disabled" : null, title: primaryTitle } }, icon(primaryMode === "play" ? "play_arrow" : "restart_alt"), el("span", { text: primaryLabel })),
       el("button", { id: "liveQueueStopBtn", attrs: { type: "button", disabled: state.queue.running ? null : "disabled", title: "Stop the running queue" } }, icon("stop"), el("span", { text: translate("stop", {}, locale) })),
       el("button", { id: "liveQueueClearDoneBtn", attrs: { type: "button", disabled: doneCount ? null : "disabled", title: "Clear completed, failed, and blocked tasks" } }, icon("playlist_remove"), el("span", { text: translate("clearFinished", {}, locale) })),
       el("button", { id: "liveQueueClearAllBtn", class: "danger-soft", attrs: { type: "button", disabled: items.length ? null : "disabled", title: "Stop and clear the full queue" } }, icon("delete_sweep"), el("span", { text: translate("clearQueue", {}, locale) }))
@@ -1688,12 +1702,31 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
   // backend payload that drove the truncation.
   const isErrorState = status === "failed" || status === "blocked";
   const activityTitle = isErrorState ? (liveQueueErrorTooltip(item) || label) : label;
+  const canPlaySingle = Boolean(item?.id) && !options.queueRunning && status === "pending" && item.localPreparing !== true;
+  const canStopSingle = Boolean(item?.id) && options.queueRunning && ["submitting", "generating", "downloading"].includes(status);
   return el("div", { class: `live-queue-task is-${groupStatusClass([item], options)}` },
     el("span", { class: "live-task-index", text: String(index + 1).padStart(2, "0") }),
     el("span", { class: "live-task-main" },
       thumb,
       el("span", { class: "live-task-prompt", attrs: { title: prompt }, text: prompt }),
-      canRegenerate
+      el("button", {
+        class: "live-task-copy",
+        data: { liveCopyPrompt: prompt },
+        attrs: { type: "button", title: "Copy prompt", "aria-label": "Copy prompt" }
+      }, icon("content_copy")),
+      canPlaySingle
+        ? el("button", {
+          class: "live-task-play",
+          data: { livePlayTaskId: String(item.id || "") },
+          attrs: { type: "button", title: "Play this task", "aria-label": "Play this task" }
+        }, icon("play_arrow"))
+        : canStopSingle
+          ? el("button", {
+            class: "live-task-stop",
+            data: { liveStopQueue: "1" },
+            attrs: { type: "button", title: "Stop queue", "aria-label": "Stop queue" }
+          }, icon("stop"))
+          : canRegenerate
         ? el("button", {
           class: "live-task-rerun",
           data: { liveRegenerateTaskId: String(item.id || "") },

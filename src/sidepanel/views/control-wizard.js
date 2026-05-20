@@ -1056,6 +1056,11 @@ function buildStep3Body(state, prompts, refs, mode) {
   // Đọc trực tiếp từ Settings – bước 3 không có toggle riêng.
   const overlapEnabled = presets.overlapEnabled === true;
   const overlapOptions = [["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"]];
+  const overlapDelayMin = Number(presets.overlapDelayMinSeconds || presets.overlapDelaySeconds || 20);
+  const overlapDelayMax = Number(presets.overlapDelayMaxSeconds || presets.overlapDelaySeconds || overlapDelayMin);
+  const completionDelayMin = Number(presets.overlapCompletionDelayMinSeconds || 0);
+  const completionDelayMax = Number(presets.overlapCompletionDelayMaxSeconds || completionDelayMin);
+  const overlapDelayText = `start ${overlapDelayMin}-${overlapDelayMax}s, task ${completionDelayMin}-${completionDelayMax}s`;
 
   const settingsCard = el("div", { class: "afw-gen-card" },
     row("tune", tr(state, "model"), tr(state, "modeModelList", { mode: modeName(state, mode) }), valSelect(modelKey, presets[modelKey], modelOptions)),
@@ -1080,7 +1085,7 @@ function buildStep3Body(state, prompts, refs, mode) {
       ? row(
           "speed",
           "Overlap",
-          "ON - starts are staggered by overlap delay",
+          `ON - ${overlapDelayText}`,
           valSelect("overlapMaxConcurrentTasks", String(presets.overlapMaxConcurrentTasks || 2), overlapOptions)
         )
       : null,

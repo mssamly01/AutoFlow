@@ -4633,6 +4633,9 @@ button:active:not(:disabled) {
   gap: 9px;
 }
 
+.live-task-copy,
+.live-task-play,
+.live-task-stop,
 .live-task-rerun {
   width: 24px;
   height: 24px;
@@ -4643,6 +4646,17 @@ button:active:not(:disabled) {
   border-color: rgba(121, 151, 226, 0.28);
 }
 
+.live-task-copy:disabled,
+.live-task-play:disabled,
+.live-task-stop:disabled,
+.live-task-rerun:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+
+.live-task-copy .material-symbols-outlined,
+.live-task-play .material-symbols-outlined,
+.live-task-stop .material-symbols-outlined,
 .live-task-rerun .material-symbols-outlined {
   font-size: 14px;
 }
@@ -5103,11 +5117,17 @@ button:active:not(:disabled) {
 
   .live-task-main { gap: 6px; }
 
+  .live-task-copy,
+  .live-task-play,
+  .live-task-stop,
   .live-task-rerun {
     width: 22px;
     height: 22px;
   }
 
+  .live-task-copy .material-symbols-outlined,
+  .live-task-play .material-symbols-outlined,
+  .live-task-stop .material-symbols-outlined,
   .live-task-rerun .material-symbols-outlined {
     font-size: 12px;
   }

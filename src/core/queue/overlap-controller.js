@@ -1,6 +1,6 @@
 // AutoFlow Overlap Queue Controller.
 // Manages concurrency gating: decides when the next task can start
-// based on a time-based delay (overlapDelaySeconds).
+// based on a time-based delay range (overlapDelayMinSeconds/MaxSeconds).
 //
 // Starts are paced one-by-one. The background pump owns the delay between
 // starts; this controller only enforces active-slot limits and task metadata.
@@ -19,14 +19,44 @@ function clampNumber(value, min, max, fallback) {
   return Math.min(max, Math.max(min, number));
 }
 
+function normalizeRange(minValue, maxValue, minBound, maxBound, fallbackMin, fallbackMax = fallbackMin) {
+  const min = clampNumber(minValue, minBound, maxBound, fallbackMin);
+  const max = clampNumber(maxValue, minBound, maxBound, fallbackMax);
+  return min <= max ? { min, max } : { min: max, max: min };
+}
+
 export function normalizeOverlapConfig(presets = {}) {
   const enabled = presets?.overlapEnabled === true;
+  const hasStartMin = Object.prototype.hasOwnProperty.call(presets || {}, "overlapDelayMinSeconds");
+  const hasStartMax = Object.prototype.hasOwnProperty.call(presets || {}, "overlapDelayMaxSeconds");
+  const hasLegacyDelay = Object.prototype.hasOwnProperty.call(presets || {}, "overlapDelaySeconds");
+  const legacyDelay = clampNumber(presets?.overlapDelaySeconds, 5, 600, 20);
+  const startDelay = normalizeRange(
+    hasStartMin ? presets?.overlapDelayMinSeconds : (hasLegacyDelay && !hasStartMax ? legacyDelay : 15),
+    hasStartMax ? presets?.overlapDelayMaxSeconds : legacyDelay,
+    5,
+    600,
+    15,
+    legacyDelay
+  );
+  const completionDelay = normalizeRange(
+    presets?.overlapCompletionDelayMinSeconds,
+    presets?.overlapCompletionDelayMaxSeconds,
+    0,
+    600,
+    4,
+    6
+  );
   return {
     enabled,
     maxConcurrentTasks: enabled
       ? clampNumber(presets?.overlapMaxConcurrentTasks, 1, 4, 2)
       : 1,
-    delaySeconds: clampNumber(presets?.overlapDelaySeconds, 5, 600, 30)
+    delaySeconds: startDelay.max,
+    delayMinSeconds: startDelay.min,
+    delayMaxSeconds: startDelay.max,
+    completionDelayMinSeconds: completionDelay.min,
+    completionDelayMaxSeconds: completionDelay.max
   };
 }
 
@@ -127,11 +157,11 @@ export function createOverlapController({
 
     const elapsedSeconds = Math.max(0, (now() - startedAtMs) / 1000);
 
-    if (elapsedSeconds >= config.delaySeconds) {
+    if (elapsedSeconds >= config.delayMaxSeconds) {
       return { ok: true, reason: "timer" };
     }
 
-    return { ok: false, reason: "waiting", elapsedSeconds, remaining: config.delaySeconds - elapsedSeconds };
+    return { ok: false, reason: "waiting", elapsedSeconds, remaining: config.delayMaxSeconds - elapsedSeconds };
   }
 
   function markUnlockedNext(taskId, reason = "unknown") {

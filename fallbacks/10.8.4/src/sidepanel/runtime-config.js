@@ -26,7 +26,7 @@ export const FLOW_MODES = Object.freeze({
 
 export function createDefaultState(now = new Date().toISOString()) {
   return {
-    version: 4,
+    version: 6,
     seededAt: now,
     ui: {
       activeRoute: "control",
@@ -124,7 +124,14 @@ export function createDefaultState(now = new Date().toISOString()) {
         mapLineRefs: true,
         autoStartNextJob: true,
         autoRetryFailedUntilZero: false,
-        autopilotT2IToF2V: "off"
+        autopilotT2IToF2V: "off",
+        overlapEnabled: true,
+        overlapMaxConcurrentTasks: 2,
+        overlapDelaySeconds: 20,
+        overlapDelayMinSeconds: 15,
+        overlapDelayMaxSeconds: 20,
+        overlapCompletionDelayMinSeconds: 4,
+        overlapCompletionDelayMaxSeconds: 6
       }
     },
     queue: {
@@ -241,7 +248,7 @@ export function mergeState(base, incoming) {
     ? output.control.transientReferenceItems.slice(0, 100)
     : [];
   output.control.saveUploadsToLibrary = output.control.saveUploadsToLibrary === true;
-  output.control.presets = normalizePresets(output.control.presets, Number(incoming.version || 0));
+  output.control.presets = normalizePresets(output.control.presets, Number(incoming.version || 0), incoming.control?.presets || {});
   output.control.references = normalizeReferences(output.control.references);
   output.queue.items = Array.isArray(output.queue.items) ? output.queue.items : [];
   output.gallery.items = Array.isArray(output.gallery.items) ? output.gallery.items : [];
@@ -263,9 +270,11 @@ export function mergeState(base, incoming) {
   return output;
 }
 
-function normalizePresets(presets = {}, sourceVersion = 0) {
+function normalizePresets(presets = {}, sourceVersion = 0, rawPresets = presets) {
   const base = createDefaultState().control.presets;
-  const out = { ...base, ...(presets && typeof presets === "object" ? presets : {}) };
+  const input = presets && typeof presets === "object" ? presets : {};
+  const rawInput = rawPresets && typeof rawPresets === "object" ? rawPresets : {};
+  const out = { ...base, ...input };
   // The validators below (allow-list checks + clampInt) replace any invalid
   // stored value with a system default. They are the single source of truth
   // for migration. We intentionally do NOT force-reset these keys for
@@ -322,6 +331,41 @@ function normalizePresets(presets = {}, sourceVersion = 0) {
   out.mapLineRefs = Boolean(out.mapLineRefs);
   out.autoStartNextJob = Boolean(out.autoStartNextJob);
   out.autoRetryFailedUntilZero = Boolean(out.autoRetryFailedUntilZero);
+  out.overlapEnabled = out.overlapEnabled !== false;
+  if (sourceVersion < 5 && out.overlapEnabled && Number(out.overlapMaxConcurrentTasks || 1) <= 1) {
+    out.overlapMaxConcurrentTasks = 2;
+  }
+  out.overlapMaxConcurrentTasks = clampInt(out.overlapMaxConcurrentTasks, 1, 4, 2);
+  const legacyOverlapDelay = clampInt(out.overlapDelaySeconds, 5, 600, 20);
+  const hasOverlapDelayMin = Object.prototype.hasOwnProperty.call(rawInput, "overlapDelayMinSeconds");
+  const hasOverlapDelayMax = Object.prototype.hasOwnProperty.call(rawInput, "overlapDelayMaxSeconds");
+  const hasLegacyOverlapDelay = Object.prototype.hasOwnProperty.call(rawInput, "overlapDelaySeconds");
+  out.overlapDelayMinSeconds = clampInt(hasOverlapDelayMin ? out.overlapDelayMinSeconds : (hasLegacyOverlapDelay ? legacyOverlapDelay : 15), 5, 600, hasLegacyOverlapDelay ? legacyOverlapDelay : 15);
+  out.overlapDelayMaxSeconds = clampInt(hasOverlapDelayMax ? out.overlapDelayMaxSeconds : (hasLegacyOverlapDelay ? legacyOverlapDelay : 20), 5, 600, hasLegacyOverlapDelay ? legacyOverlapDelay : 20);
+  if (out.overlapDelayMaxSeconds < out.overlapDelayMinSeconds) {
+    [out.overlapDelayMinSeconds, out.overlapDelayMaxSeconds] = [out.overlapDelayMaxSeconds, out.overlapDelayMinSeconds];
+  }
+  out.overlapDelaySeconds = out.overlapDelayMaxSeconds;
+  const hasCompletionDelayMin = Object.prototype.hasOwnProperty.call(rawInput, "overlapCompletionDelayMinSeconds");
+  const hasCompletionDelayMax = Object.prototype.hasOwnProperty.call(rawInput, "overlapCompletionDelayMaxSeconds");
+  const shouldMigrateOldTaskDelayDefault = sourceVersion < 6
+    && Number(out.overlapCompletionDelayMinSeconds || 0) === 0
+    && Number(out.overlapCompletionDelayMaxSeconds || 0) === 0;
+  out.overlapCompletionDelayMinSeconds = clampInt(
+    shouldMigrateOldTaskDelayDefault || !hasCompletionDelayMin ? 4 : out.overlapCompletionDelayMinSeconds,
+    0,
+    600,
+    4
+  );
+  out.overlapCompletionDelayMaxSeconds = clampInt(
+    shouldMigrateOldTaskDelayDefault || !hasCompletionDelayMax ? 6 : out.overlapCompletionDelayMaxSeconds,
+    0,
+    600,
+    6
+  );
+  if (out.overlapCompletionDelayMaxSeconds < out.overlapCompletionDelayMinSeconds) {
+    [out.overlapCompletionDelayMinSeconds, out.overlapCompletionDelayMaxSeconds] = [out.overlapCompletionDelayMaxSeconds, out.overlapCompletionDelayMinSeconds];
+  }
   return out;
 }
 
@@ -392,7 +436,7 @@ function normalizeHistoryControl(control = {}) {
     oneToOneBatchRefIds: normalizeIdArray(control?.oneToOneBatchRefIds || []),
     references: refs,
     activeApplyMode: String(control?.activeApplyMode || "shared"),
-    presets: normalizePresets(control?.presets || {}, 4)
+    presets: normalizePresets(control?.presets || {}, 4, control?.presets || {})
   };
 }
 

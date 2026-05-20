@@ -4408,8 +4408,6 @@ async function enqueueAndRun() {
       if (state.queue.running) {
         scheduleRuntimeRefresh(0);
         scheduleLiveQueueRefreshBurst();
-      } else {
-        await runQueue();
       }
       return;
     }
@@ -4449,7 +4447,7 @@ async function enqueueAndRun() {
     }
     await persistState();
     render();
-    await runQueue();
+    appendLog("info", "queue", `Queue ready with ${added} task${added === 1 ? "" : "s"}. Press Play to start.`);
   } catch (error) {
     appendLog("error", "diagnostics", `Run failed before/around queue start: ${error.message}; ${compactRunDiagnosticText(runDiagnosticSummary())}.`);
     // Surface a user-visible explanation in the wizard step 3 banner so the
@@ -4603,6 +4601,25 @@ async function runQueue() {
   render();
 }
 
+async function playQueueTask(taskId) {
+  const id = String(taskId || "").trim();
+  if (!id) return;
+  state.ui.activeRoute = "live";
+  await persistState();
+  render();
+  const response = await send(MessageType.QueueStartTask, { id, environment: authEnvironment(), presets: state.control.presets });
+  applyRuntimePayload(response?.payload || {});
+  scheduleRuntimeRefresh(0);
+  scheduleLiveQueueRefreshBurst();
+  if (response?.payload?.ok === false) {
+    appendLog("warn", "queue", response.payload.error || "Could not play task.");
+  } else {
+    appendLog("info", "queue", `Task ${id.slice(0, 8)} started.`);
+  }
+  await persistState();
+  render();
+}
+
 async function resumeQueue() {
   const response = await send(MessageType.QueueResume, { environment: authEnvironment(), presets: state.control.presets });
   applyRuntimePayload(response?.payload || {});
@@ -4662,6 +4679,8 @@ galleryController = createGalleryController({
   ensureMediaIds,
   taskSettingsForMode,
   queueBatchTitle,
+  runQueue,
+  playQueueTask,
   resumeQueue,
   stopQueue,
   regenerateTask,

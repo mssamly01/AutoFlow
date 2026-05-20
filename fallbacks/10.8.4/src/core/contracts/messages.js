@@ -11,6 +11,7 @@ export const MessageType = Object.freeze({
   PageCommandResult: "af.rebuild.page.command.result",
   QueueAddJob: "af.rebuild.queue.addJob",
   QueueStart: "af.rebuild.queue.start",
+  QueueStartTask: "af.rebuild.queue.startTask",
   QueueResume: "af.rebuild.queue.resume",
   QueueStop: "af.rebuild.queue.stop",
   QueueClear: "af.rebuild.queue.clear",
