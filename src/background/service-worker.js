@@ -4109,7 +4109,10 @@ function pumpOverlapQueue(tabId) {
   const inFlightSubmitOnlyCount = [...activeSubmitRuns.keys()]
     .filter((taskId) => !activeTaskIds.has(String(taskId)))
     .length;
-  const totalActiveCount = activeTasks.length + inFlightSubmitOnlyCount;
+  const activeWatchOnlyCount = [...activeWatchRuns.keys()]
+    .filter((taskId) => !activeTaskIds.has(String(taskId)) && !activeSubmitRuns.has(String(taskId)))
+    .length;
+  const totalActiveCount = activeTasks.length + inFlightSubmitOnlyCount + activeWatchOnlyCount;
   const freeSlots = Math.max(0, config.maxConcurrentTasks - totalActiveCount);
   if (totalActiveCount >= config.maxConcurrentTasks) {
     overlapReachedMaxConcurrent = true;

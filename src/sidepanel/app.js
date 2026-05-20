@@ -4392,8 +4392,8 @@ async function enqueueAndRun() {
     state.ui.galleryTab = state.control.mode === FLOW_MODES.textToImage ? "images" : "videos";
     const preparingPrompts = jobPromptLinesForRun();
     appendLog("info", "queue", `Preparing ${preparingPrompts.length} prompt${preparingPrompts.length === 1 ? "" : "s"} for ${state.ui.galleryTab}.`);
-    await persistState();
     render();
+    await nextAnimationFrame();
     const jobs = await buildJobs();
     const payloadSummary = queuePayloadSummary(jobs);
     appendLog("info", "diagnostics", `Job build complete: jobs=${payloadSummary.jobs} refs=${payloadSummary.refInputs} blobRefs=${payloadSummary.blobRefs} inlineRefs=${payloadSummary.inlineDataRefs} mediaIdRefs=${payloadSummary.mediaIdRefs} payloadBytes=${payloadSummary.approxPayloadBytes}.`);
@@ -4449,6 +4449,10 @@ async function requestEnqueueAndRun() {
   if (enqueueAndRunInFlight) return;
   enqueueAndRunInFlight = true;
   try {
+    state.ui.activeRoute = "live";
+    state.ui.galleryTab = state.control.mode === FLOW_MODES.textToImage ? "images" : "videos";
+    render();
+    await nextAnimationFrame();
     await enqueueAndRun();
   } finally {
     enqueueAndRunInFlight = false;
@@ -4530,6 +4534,19 @@ function modeHasAnyReference(currentState = state) {
       || splitIds(refs.omniRefRefs).length > 0;
   }
   return false;
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    requestAnimationFrame(finish);
+    window.setTimeout(finish, 80);
+  });
 }
 
 function queueBatchTitle(mode, count = 0) {
