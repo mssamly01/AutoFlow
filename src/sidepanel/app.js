@@ -1161,6 +1161,10 @@ function applyRuntimePayload(payload = {}, options = {}) {
   }
   const runningWasTrue = state.queue.running === true;
   if (typeof payload.queueRunning === "boolean") state.queue.running = payload.queueRunning;
+  if (runningWasTrue && state.queue.running === false) {
+    state.queue.singleTaskPlayTaskId = "";
+    state.queue.singleTaskPlayUnlockedAt = 0;
+  }
   // Autopilot T2I -> F2V (issue #208). Detect the running -> idle transition
   // and, if a T2I batch armed the autopilot, fire-and-forget a follow-up F2V
   // enqueue. We don't await here so applyRuntimePayload stays synchronous-ish
@@ -4601,6 +4605,13 @@ async function runQueue() {
   render();
 }
 
+function selectSingleTaskOverlapDelayMs() {
+  const presets = state.control?.presets || {};
+  const minDelay = Math.max(0, Number(presets.overlapDelayMinSeconds || presets.overlapDelaySeconds || 15)) * 1000;
+  const maxDelay = Math.max(minDelay, Number(presets.overlapDelayMaxSeconds || presets.overlapDelaySeconds || 20) * 1000);
+  return Math.round(minDelay + Math.random() * (maxDelay - minDelay));
+}
+
 async function playQueueTask(taskId) {
   const id = String(taskId || "").trim();
   if (!id) return;
@@ -4614,6 +4625,16 @@ async function playQueueTask(taskId) {
   if (response?.payload?.ok === false) {
     appendLog("warn", "queue", response.payload.error || "Could not play task.");
   } else {
+    const startedTaskId = String(response?.payload?.startedTaskId || id);
+    const delayMs = selectSingleTaskOverlapDelayMs();
+    const unlockedAt = Date.now() + delayMs;
+    state.queue.singleTaskPlayTaskId = startedTaskId;
+    state.queue.singleTaskPlayUnlockedAt = unlockedAt;
+    window.setTimeout(() => {
+      if (state.queue.singleTaskPlayUnlockedAt === unlockedAt) {
+        render();
+      }
+    }, delayMs + 50);
     appendLog("info", "queue", `Task ${id.slice(0, 8)} started.`);
   }
   await persistState();

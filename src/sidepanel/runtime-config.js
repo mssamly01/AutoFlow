@@ -140,7 +140,9 @@ export function createDefaultState(now = new Date().toISOString()) {
       running: false,
       paused: false,
       items: [],
-      runtimeEvents: []
+      runtimeEvents: [],
+      singleTaskPlayTaskId: "",
+      singleTaskPlayUnlockedAt: 0
     },
     gallery: {
       items: [],

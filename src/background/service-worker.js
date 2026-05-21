@@ -3885,7 +3885,7 @@ async function resolveContinuityChainForTask(task = {}, tabId = null) {
 }
 
 // ---------- Overlap Queue Pump ----------
-function startTaskWatcher(taskId, tabId) {
+function startTaskWatcher(taskId, tabId, options = {}) {
   if (!taskId) return;
   if (activeWatchRuns.has(taskId)) return;
 
@@ -3921,7 +3921,10 @@ function startTaskWatcher(taskId, tabId) {
     } finally {
       activeWatchRuns.delete(taskId);
       scheduleOverlapRefillDelay(overlapController.getConfig(), taskId, "task_settled");
-      pumpOverlapQueue(tabId);
+      if (options.pumpOnSettle !== false) pumpOverlapQueue(tabId);
+      if (options.settleQueueOnIdle === true) {
+        settleManualQueueIfIdle("manual_overlap_watch_finished").catch(() => {});
+      }
       stopOverlapTimerIfIdle();
     }
   })();
@@ -4214,6 +4217,130 @@ function pumpOverlapQueue(tabId) {
   }
 
   persistQueueState().catch(() => {});
+}
+
+function activeOverlapRuntimeCount() {
+  const activeTasks = overlapController.getActiveTasks();
+  const activeTaskIds = new Set(activeTasks.map((task) => String(task.id || "")));
+  const inFlightSubmitOnlyCount = [...activeSubmitRuns.keys()]
+    .filter((taskId) => !activeTaskIds.has(String(taskId)))
+    .length;
+  return activeTasks.length + inFlightSubmitOnlyCount;
+}
+
+function manualOverlapStartDecision(task = {}) {
+  const config = overlapController.getConfig();
+  if (!config.enabled || config.maxConcurrentTasks <= 1) {
+    return { ok: false, error: "queue_already_running" };
+  }
+  if (!task?.id) {
+    return { ok: false, error: "missing_task" };
+  }
+  if (activeSubmitRuns.has(task.id) || activeWatchRuns.has(task.id) || isTaskActive(task)) {
+    return { ok: false, error: `Task is ${task.status || "already active"}` };
+  }
+  if (activeOverlapRuntimeCount() >= config.maxConcurrentTasks) {
+    return { ok: false, error: "overlap_slots_full" };
+  }
+  const activeDomSubmit = overlapController
+    .getActiveTasks()
+    .some((activeTask) => taskPrefersDom(activeTask) && String(activeTask.status || "").toLowerCase() === TaskStatus.submitting);
+  if (taskPrefersDom(task) && (hasActiveDomSubmitRun() || activeDomSubmit)) {
+    return { ok: false, error: "dom_submit_busy" };
+  }
+  return { ok: true, config };
+}
+
+async function settleManualQueueIfIdle(reason = "manual_overlap_idle") {
+  if (!runtimeState.queueRunning) return false;
+  if (activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || hasActiveTasks()) return false;
+  stopOverlapTimerIfIdle();
+  clearQueueStartingTask();
+  await releaseDebuggerSessions(reason, recordDebuggerTrace);
+  runtimeState.queueRunning = false;
+  await persistQueueState();
+  recordEvent({ type: "queue.manual_overlap.stop", reason });
+  return true;
+}
+
+function startManualOverlapQueueTask(taskId, preferredTabId, config = overlapController.getConfig()) {
+  const id = String(taskId || "");
+  if (!id || activeSubmitRuns.has(id) || activeWatchRuns.has(id)) return false;
+  const initialTask = ledger.getTask(id);
+  if (!initialTask || initialTask.status !== TaskStatus.pending) return false;
+
+  markOverlapTaskStarted(id, config);
+
+  const runPromise = (async () => {
+    let shouldSettleOnSubmitFinish = true;
+    try {
+      await queueReady;
+      const tab = await findFlowTab(preferredTabId);
+      if (!tab?.id) throw new Error("flow_tab_not_found");
+
+      let task = ledger.getTask(id);
+      if (!task) throw new Error(`Unknown task id: ${id}`);
+      if (task.status !== TaskStatus.pending) return;
+
+      const continuity = await resolveContinuityChainForTask(task, tab.id);
+      if (continuity.waiting || continuity.blocked) return;
+
+      task = continuity.task || ledger.getTask(id) || task;
+      await ensureTaskProjectId(task, tab.id);
+      await persistQueueState();
+      if (!runtimeState.queueRunning) return;
+
+      const executor = createExecutorForTab(tab.id);
+      const taskToRun = ledger.getTask(task.id) || task;
+      const result = await executor.runTask(taskToRun.id, {
+        submitOnly: true,
+        overlap: true
+      });
+
+      const status = String(result?.status || "").toLowerCase();
+      if (status === TaskStatus.failed || status === "failed") {
+        throw new Error(overlapFailureTextFromResult(result));
+      }
+
+      recordEvent({
+        type: "queue.task.manual_overlap_started",
+        taskId: result?.id || id,
+        status: result?.status || ""
+      });
+
+      if (result?.status === TaskStatus.generating) {
+        shouldSettleOnSubmitFinish = false;
+        startTaskWatcher(result.id || id, tab.id, {
+          pumpOnSettle: false,
+          settleQueueOnIdle: true
+        });
+      } else if (result?.status === TaskStatus.complete) {
+        await sleep(250);
+        await autoDownloadCompletedTasks([result.id || id], "manual_overlap_immediate_complete");
+      }
+
+      await persistQueueState();
+    } catch (error) {
+      const errorText = compactErrorText(error, "MANUAL_OVERLAP_SUBMIT_FAILED");
+      console.warn("[AutoFlow][ManualOverlap] failed", {
+        taskId: id,
+        error: errorText,
+        stack: error?.stack || ""
+      });
+      scheduler.markFailure(id, error);
+      await persistQueueState();
+    } finally {
+      activeSubmitRuns.delete(id);
+      if (shouldSettleOnSubmitFinish) {
+        settleManualQueueIfIdle("manual_overlap_submit_finished").catch(() => {});
+      }
+      stopOverlapTimerIfIdle();
+    }
+  })();
+
+  activeSubmitRuns.set(id, runPromise);
+  persistQueueState().catch(() => {});
+  return true;
 }
 
 async function runQueueUntilIdle(preferredTabId) {
@@ -4572,8 +4699,13 @@ function runSingleQueueTask(taskId, preferredTabId) {
     } finally {
       stopOverlapTimerIfIdle();
       clearQueueStartingTask(taskId);
-      await releaseDebuggerSessions("single_task_finished", recordDebuggerTrace);
       if (runtimeState.queueRunToken === runToken) {
+        if (activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || hasActiveTasks()) {
+          await persistQueueState();
+          recordEvent({ type: "queue.task.play_keep_running", runToken, taskId });
+          return;
+        }
+        await releaseDebuggerSessions("single_task_finished", recordDebuggerTrace);
         runtimeState.queueRunning = false;
         await persistQueueState();
         recordEvent({ type: "queue.task.play_stop", runToken, taskId });
@@ -5430,16 +5562,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }));
         return;
       }
-      if (runtimeState.queueRunning) {
-        sendResponse(createMessage(MessageType.QueueStartTask, {
-          ok: false,
-          error: "queue_already_running",
-          queueRunning: runtimeState.queueRunning,
-          queue: queueState(),
-          gallery: galleryState()
-        }));
-        return;
-      }
       if (task.status !== TaskStatus.pending) {
         sendResponse(createMessage(MessageType.QueueStartTask, {
           ok: false,
@@ -5449,6 +5571,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           gallery: galleryState()
         }));
         return;
+      }
+
+      let manualOverlapDecision = null;
+      if (runtimeState.queueRunning) {
+        manualOverlapDecision = manualOverlapStartDecision(task);
+        if (!manualOverlapDecision.ok) {
+          sendResponse(createMessage(MessageType.QueueStartTask, {
+            ok: false,
+            error: manualOverlapDecision.error || "queue_already_running",
+            queueRunning: runtimeState.queueRunning,
+            queue: queueState(),
+            gallery: galleryState()
+          }));
+          return;
+        }
       }
 
       const access = await validateQueueStartAccess(task);
@@ -5468,7 +5605,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      const started = runSingleQueueTask(task.id, Number(message.payload?.tabId || sender?.tab?.id || 0) || undefined);
+      const tabId = Number(message.payload?.tabId || sender?.tab?.id || 0) || undefined;
+      const started = runtimeState.queueRunning
+        ? startManualOverlapQueueTask(task.id, tabId, manualOverlapDecision?.config)
+        : runSingleQueueTask(task.id, tabId);
       sendResponse(createMessage(MessageType.QueueStartTask, {
         ok: started,
         access,

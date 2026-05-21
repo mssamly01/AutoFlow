@@ -1339,6 +1339,8 @@ function queueGroups(items = [], options = {}) {
     return {
       ...group,
       queueRunning,
+      singleTaskPlayTaskId: String(options.singleTaskPlayTaskId || ""),
+      singleTaskPlayUnlockedAt: Number(options.singleTaskPlayUnlockedAt || 0),
       title: first.jobTitle || `${modeLabel(first.mode, locale)} - ${group.items.length} prompt${group.items.length === 1 ? "" : "s"}`,
       preview: first.prompt || first.id || "Untitled job",
       statusClass: groupStatusClass(group.items, { queueRunning }),
@@ -1517,7 +1519,21 @@ function renderGalleryHowTo(active, locale = "en") {
 function renderLiveQueueGallery(state, selected = new Set(), options = {}) {
   const locale = state.control?.presets?.language || "en";
   const referenceLookup = buildLiveQueueReferenceLookup(state);
-  const allGroups = queueGroups(state.queue.items, { queueRunning: state.queue?.running === true, locale });
+  const queueItems = state.queue.items || [];
+  const overlapEnabled = state.control?.presets?.overlapEnabled === true;
+  const maxConcurrentTasks = overlapEnabled
+    ? Math.max(1, Number(state.control?.presets?.overlapMaxConcurrentTasks || 2) || 2)
+    : 1;
+  const activeTaskCount = visibleQueueItems(queueItems)
+    .filter((item) => ["submitting", "generating", "downloading"].includes(String(item.status || "").toLowerCase()) || item.runtimeSubmitting === true)
+    .length;
+  const overlapSlotsAvailable = !state.queue?.running || activeTaskCount < maxConcurrentTasks;
+  const allGroups = queueGroups(queueItems, {
+    queueRunning: state.queue?.running === true,
+    singleTaskPlayTaskId: String(state.queue?.singleTaskPlayTaskId || ""),
+    singleTaskPlayUnlockedAt: Number(state.queue?.singleTaskPlayUnlockedAt || 0),
+    locale
+  });
   const activeGroups = allGroups.filter((group) => group.statusClass !== "done");
   const groups = options.showAllGroups
     ? (activeGroups.length ? activeGroups : allGroups)
@@ -1536,7 +1552,13 @@ function renderLiveQueueGallery(state, selected = new Set(), options = {}) {
           el("span", { class: "q-status", text: group.statusLabel })
         ),
         el("div", { class: "live-queue-task-list" },
-          group.items.map((item, index) => renderLiveQueueTaskRow(item, index, selected, { queueRunning: group.queueRunning, referenceLookup }, locale))
+          group.items.map((item, index) => renderLiveQueueTaskRow(item, index, selected, {
+            queueRunning: group.queueRunning,
+            singleTaskPlayTaskId: group.singleTaskPlayTaskId || "",
+            singleTaskPlayUnlockedAt: group.singleTaskPlayUnlockedAt || 0,
+            overlapSlotsAvailable,
+            referenceLookup
+          }, locale))
         )
       ))
       : el("div", { class: "gallery-empty", text: translate("noLiveQueueItems", {}, locale) })
@@ -1704,8 +1726,14 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
   // backend payload that drove the truncation.
   const isErrorState = status === "failed" || status === "blocked";
   const activityTitle = isErrorState ? (liveQueueErrorTooltip(item) || label) : label;
-  const canPlaySingle = Boolean(item?.id) && rawStatus === "pending" && item.localPreparing !== true;
-  const playSingleDisabled = options.queueRunning === true;
+  const isSingleTaskMode = Boolean(options.singleTaskPlayTaskId);
+  const isThisTaskRunning = isSingleTaskMode && String(item?.id || "") === options.singleTaskPlayTaskId;
+  const overlapDelayActive = isSingleTaskMode && options.queueRunning
+    && Number(options.singleTaskPlayUnlockedAt || 0) > Date.now();
+  const canPlaySingle = Boolean(item?.id) && rawStatus === "pending" && item.localPreparing !== true
+    && (!options.queueRunning || (isSingleTaskMode && !isThisTaskRunning));
+  const playSingleDisabled = options.queueRunning === true
+    && (!isSingleTaskMode || overlapDelayActive || options.overlapSlotsAvailable === false);
   const canStopSingle = Boolean(item?.id) && options.queueRunning && ["submitting", "generating", "downloading"].includes(status);
   return el("div", { class: `live-queue-task is-${groupStatusClass([item], options)}` },
     el("span", { class: "live-task-index", text: String(index + 1).padStart(2, "0") }),
