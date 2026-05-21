@@ -1572,10 +1572,21 @@ function renderLiveQueueManager(state, locale = "en") {
   const pendingCount = items.filter((item) => liveQueueEffectiveStatus(item, { queueRunning: false }) === "pending").length;
   const incompleteDownloadCount = items.filter((item) => liveQueueEffectiveStatus(item) === "download_incomplete").length;
   const openCount = Math.max(0, items.length - doneCount);
+  
+  const referenceLookup = buildLiveQueueReferenceLookup(state);
+  const pendingItems = items.filter((item) => liveQueueEffectiveStatus(item, { queueRunning: false }) === "pending");
+  const anyPendingTaskMissingRefs = pendingItems.some((item) => isTaskMissingRequiredRefs(item, referenceLookup));
+
   const primaryMode = !blockedCount && pendingCount > 0 ? "play" : "resume";
-  const primaryDisabled = state.queue.running || (primaryMode === "play" ? pendingCount <= 0 : blockedCount <= 0);
-  const primaryTitle = primaryMode === "play" ? "Play pending tasks" : "Resume blocked or failed tasks";
+  let primaryDisabled = state.queue.running || (primaryMode === "play" ? pendingCount <= 0 : blockedCount <= 0);
+  let primaryTitle = primaryMode === "play" ? "Play pending tasks" : "Resume blocked or failed tasks";
   const primaryLabel = primaryMode === "play" ? "Play" : translate("resume", {}, locale);
+
+  if (primaryMode === "play" && anyPendingTaskMissingRefs) {
+    primaryDisabled = true;
+    primaryTitle = "Play pending tasks (Waiting for reference images to be matched)";
+  }
+
   return el("div", { class: "live-queue-manager" },
     el("div", { class: "live-queue-manager-copy" },
       el("strong", { text: translate("queueManager", {}, locale) }),
@@ -1732,8 +1743,10 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
     && Number(options.singleTaskPlayUnlockedAt || 0) > Date.now();
   const canPlaySingle = Boolean(item?.id) && rawStatus === "pending" && item.localPreparing !== true
     && (!options.queueRunning || (isSingleTaskMode && !isThisTaskRunning));
-  const playSingleDisabled = options.queueRunning === true
-    && (!isSingleTaskMode || overlapDelayActive || options.overlapSlotsAvailable === false);
+  const isMissingRefs = isTaskMissingRequiredRefs(item, options.referenceLookup);
+  const playSingleDisabled = (options.queueRunning === true
+    && (!isSingleTaskMode || overlapDelayActive || options.overlapSlotsAvailable === false))
+    || isMissingRefs;
   const canStopSingle = Boolean(item?.id) && options.queueRunning && ["submitting", "generating", "downloading"].includes(status);
   return el("div", { class: `live-queue-task is-${groupStatusClass([item], options)}` },
     el("span", { class: "live-task-index", text: String(index + 1).padStart(2, "0") }),
@@ -1749,7 +1762,7 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
         ? el("button", {
           class: "live-task-play",
           data: { livePlayTaskId: String(item.id || "") },
-          attrs: { type: "button", title: "Play this task", "aria-label": "Play this task", disabled: playSingleDisabled ? "disabled" : null }
+          attrs: { type: "button", title: isMissingRefs ? "Waiting for reference images to be matched" : "Play this task", "aria-label": "Play this task", disabled: playSingleDisabled ? "disabled" : null }
         }, icon("play_arrow"))
         : canStopSingle
           ? el("button", {
@@ -1875,6 +1888,9 @@ function liveQueueResolveReference(ref = {}, lookup = null) {
 
 function liveQueueInputReferencePreviews(item = {}, options = {}) {
   const lookup = options.referenceLookup || null;
+  const requireBackendMediaId = options.requireBackendMediaId === true;
+  const isApi = (item.submitPath || item.submitPathPreference || "api_first") !== "dom_first";
+
   const refs = []
     .concat(Array.isArray(item.refInputs) ? item.refInputs : [])
     .concat(item.startRefInput ? [item.startRefInput] : [])
@@ -1894,6 +1910,25 @@ function liveQueueInputReferencePreviews(item = {}, options = {}) {
     .map((ref, index) => {
       const resolved = liveQueueResolveReference(ref, lookup);
       const mediaId = String(resolved?.mediaId || resolved?.assetImageId || ref?.mediaId || ref?.assetImageId || ref?.id || "").trim();
+
+      // Enforce backend mediaId check in API mode if required
+      if (requireBackendMediaId && isApi) {
+        const localId = String(ref?.id || "").trim();
+        const localBlobStoreId = String(ref?.blobStoreId || "").trim();
+        const resolvedId = String(resolved?.id || "").trim();
+        const resolvedBlobStoreId = String(resolved?.blobStoreId || "").trim();
+
+        const hasRealBackendMediaId = mediaId &&
+          mediaId !== localId &&
+          mediaId !== localBlobStoreId &&
+          mediaId !== resolvedId &&
+          mediaId !== resolvedBlobStoreId;
+
+        if (!hasRealBackendMediaId) {
+          return null;
+        }
+      }
+
       const src = resolved?.imageUrl || resolved?.dataUrl || resolved?.mediaUrl || (mediaId ? buildMediaRedirectUrl({ mediaId }) : "");
       const previewUrl = resolved?.dataUrl || resolved?.mediaUrl || resolved?.imageUrl || src;
       const id = String(ref?.mediaId || ref?.assetImageId || ref?.id || ref?.blobStoreId || src || `${index}`).trim();
@@ -1910,6 +1945,65 @@ function liveQueueInputReferencePreviews(item = {}, options = {}) {
       };
     })
     .filter(Boolean);
+}
+
+function isTaskMissingRequiredRefs(item = {}, referenceLookup = null) {
+  if (item.localPreparing === true) {
+    return true;
+  }
+
+  const resolvedPreviews = liveQueueInputReferencePreviews(item, {
+    referenceLookup,
+    requireBackendMediaId: true
+  });
+
+  if (item.mode === FLOW_MODES.imageToVideo) {
+    if (resolvedPreviews.length < 1) return true;
+    const hasEndRef = item.endRefInput && (item.endRefInput.id || item.endRefInput.fileName || item.endRefInput.name || item.endRefInput.mediaId);
+    const hasEndMediaId = item.endMediaId && String(item.endMediaId).trim();
+    if (hasEndRef || hasEndMediaId) {
+      if (resolvedPreviews.length < 2) return true;
+    }
+  }
+
+  if (item.mode === FLOW_MODES.ingredientsToVideo) {
+    if (resolvedPreviews.length < 1) return true;
+  }
+
+  const specifiedRefs = [];
+  const addRef = (ref) => {
+    if (!ref) return;
+    const id = String(ref.mediaId || ref.assetImageId || ref.id || ref.blobStoreId || ref.fileName || ref.name || "").trim();
+    if (id) {
+      specifiedRefs.push(id);
+    }
+  };
+
+  if (Array.isArray(item.refInputs)) {
+    item.refInputs.forEach(addRef);
+  }
+  addRef(item.startRefInput);
+  addRef(item.endRefInput);
+
+  if (Array.isArray(item.refMediaIds)) {
+    item.refMediaIds.forEach((id) => {
+      const cleaned = String(id || "").trim();
+      if (cleaned) specifiedRefs.push(cleaned);
+    });
+  }
+  if (item.startMediaId && String(item.startMediaId).trim()) {
+    specifiedRefs.push(String(item.startMediaId).trim());
+  }
+  if (item.endMediaId && String(item.endMediaId).trim()) {
+    specifiedRefs.push(String(item.endMediaId).trim());
+  }
+
+  const uniqueSpecifiedCount = new Set(specifiedRefs).size;
+  if (resolvedPreviews.length < uniqueSpecifiedCount) {
+    return true;
+  }
+
+  return false;
 }
 
 function liveQueueInputPreview(item = {}, options = {}) {

@@ -4030,8 +4030,6 @@ function scheduleOverlapNextStartDelay(config = {}, baseAtMs = Date.now()) {
 }
 
 function scheduleOverlapRefillDelay(config = {}, taskId = "", reason = "completion") {
-  if (!overlapReachedMaxConcurrent) return 0;
-  if (typeof scheduler.nextPendingTasks === "function" && !scheduler.nextPendingTasks(1).length) return 0;
   const delaySeconds = randomSecondsBetween(config.completionDelayMinSeconds, config.completionDelayMaxSeconds);
   overlapRefillDelaySeconds = delaySeconds;
   overlapRefillReadyTimesMs = [
@@ -4063,12 +4061,11 @@ function overlapStartPaceWaitMs(config = {}) {
 }
 
 function overlapRefillWaitMs(config = {}) {
-  if (!overlapReachedMaxConcurrent) return 0;
   overlapRefillReadyTimesMs = overlapRefillReadyTimesMs
     .filter((time) => Number.isFinite(time))
     .sort((a, b) => a - b);
   if (!overlapRefillReadyTimesMs.length) {
-    scheduleOverlapRefillDelay(config, "", "slot_available");
+    return 0;
   }
   return Math.max(0, (overlapRefillReadyTimesMs[0] || 0) - Date.now());
 }
@@ -4076,9 +4073,10 @@ function overlapRefillWaitMs(config = {}) {
 function markOverlapTaskStarted(taskId, config = {}, options = {}) {
   overlapLastTaskStartedAtMs = Date.now();
   overlapLastTaskStartedId = String(taskId || "");
-  if (options.refillMode) {
+  if (options.refillMode || overlapRefillReadyTimesMs.length > 0) {
     consumeOverlapRefillDelay();
-  } else {
+  }
+  if (!options.refillMode) {
     scheduleOverlapNextStartDelay(config, overlapLastTaskStartedAtMs);
   }
   clearQueueStartingTask(taskId);
@@ -4105,7 +4103,10 @@ function pumpOverlapQueue(tabId) {
   const inFlightSubmitOnlyCount = [...activeSubmitRuns.keys()]
     .filter((taskId) => !activeTaskIds.has(String(taskId)))
     .length;
-  const totalActiveCount = activeTasks.length + inFlightSubmitOnlyCount;
+  const inFlightWatchCount = [...activeWatchRuns.keys()]
+    .filter((taskId) => !activeTaskIds.has(String(taskId)))
+    .length;
+  const totalActiveCount = activeTasks.length + inFlightSubmitOnlyCount + inFlightWatchCount;
   const freeSlots = Math.max(0, config.maxConcurrentTasks - totalActiveCount);
   if (totalActiveCount >= config.maxConcurrentTasks) {
     overlapReachedMaxConcurrent = true;
@@ -4114,7 +4115,9 @@ function pumpOverlapQueue(tabId) {
 
   const refillMode = overlapReachedMaxConcurrent === true;
   if (!refillMode) {
-    const waitMs = overlapStartPaceWaitMs(config);
+    const startWaitMs = overlapStartPaceWaitMs(config);
+    const refillWaitMs = overlapRefillWaitMs(config);
+    const waitMs = Math.max(startWaitMs, refillWaitMs);
     if (waitMs > 0) {
       schedulePumpRetry(waitMs, tabId);
       return;
@@ -4158,7 +4161,6 @@ function pumpOverlapQueue(tabId) {
 
     const executor = createExecutorForTab(tabId);
     const runPromise = (async () => {
-      let shouldDelayAfterImmediateComplete = false;
       try {
         // Không markSubmitting ở đây.
         // executor.runTask() yêu cầu task còn pending và sẽ tự markSubmitting.
@@ -4185,7 +4187,6 @@ function pumpOverlapQueue(tabId) {
         } else if (result?.status === TaskStatus.complete) {
           await sleep(250);
           await autoDownloadCompletedTasks([task.id], "overlap_immediate_complete");
-          shouldDelayAfterImmediateComplete = true;
         }
 
         await persistQueueState();
@@ -4205,8 +4206,8 @@ function pumpOverlapQueue(tabId) {
         await persistQueueState();
       } finally {
         activeSubmitRuns.delete(task.id);
-        if (shouldDelayAfterImmediateComplete) {
-          scheduleOverlapRefillDelay(overlapController.getConfig(), task.id, "task_complete");
+        if (!activeWatchRuns.has(task.id)) {
+          scheduleOverlapRefillDelay(overlapController.getConfig(), task.id, "task_finished");
         }
         pumpOverlapQueue(tabId);
         stopOverlapTimerIfIdle();
@@ -4225,7 +4226,10 @@ function activeOverlapRuntimeCount() {
   const inFlightSubmitOnlyCount = [...activeSubmitRuns.keys()]
     .filter((taskId) => !activeTaskIds.has(String(taskId)))
     .length;
-  return activeTasks.length + inFlightSubmitOnlyCount;
+  const inFlightWatchCount = [...activeWatchRuns.keys()]
+    .filter((taskId) => !activeTaskIds.has(String(taskId)))
+    .length;
+  return activeTasks.length + inFlightSubmitOnlyCount + inFlightWatchCount;
 }
 
 function manualOverlapStartDecision(task = {}) {
