@@ -1161,6 +1161,11 @@ function applyRuntimePayload(payload = {}, options = {}) {
   }
   const runningWasTrue = state.queue.running === true;
   if (typeof payload.queueRunning === "boolean") state.queue.running = payload.queueRunning;
+  // Clear single-task play tracking when queue becomes idle.
+  if (runningWasTrue && state.queue.running === false) {
+    state.queue.singleTaskPlayTaskId = "";
+    state.queue.singleTaskPlayUnlockedAt = 0;
+  }
   // Autopilot T2I -> F2V (issue #208). Detect the running -> idle transition
   // and, if a T2I batch armed the autopilot, fire-and-forget a follow-up F2V
   // enqueue. We don't await here so applyRuntimePayload stays synchronous-ish
@@ -4605,6 +4610,8 @@ async function playQueueTask(taskId) {
   const id = String(taskId || "").trim();
   if (!id) return;
   state.ui.activeRoute = "live";
+  state.queue.singleTaskPlayTaskId = id;
+  state.queue.singleTaskPlayUnlockedAt = 0;
   await persistState();
   render();
   const response = await send(MessageType.QueueStartTask, { id, environment: authEnvironment(), presets: state.control.presets });
@@ -4612,8 +4619,22 @@ async function playQueueTask(taskId) {
   scheduleRuntimeRefresh(0);
   scheduleLiveQueueRefreshBurst();
   if (response?.payload?.ok === false) {
+    state.queue.singleTaskPlayTaskId = "";
+    state.queue.singleTaskPlayUnlockedAt = 0;
     appendLog("warn", "queue", response.payload.error || "Could not play task.");
   } else {
+    // Compute overlap delay from presets and schedule re-render to re-enable
+    // play buttons on other tasks once the staggered-start window has passed.
+    const minDelay = Math.max(0, Number(state.control.presets?.overlapDelayMinSeconds || 15)) * 1000;
+    const maxDelay = Math.max(minDelay, Number(state.control.presets?.overlapDelayMaxSeconds || 20)) * 1000;
+    const delayMs = Math.round(minDelay + Math.random() * (maxDelay - minDelay));
+    const unlockedAt = Date.now() + delayMs;
+    state.queue.singleTaskPlayUnlockedAt = unlockedAt;
+    window.setTimeout(() => {
+      if (state.queue.singleTaskPlayUnlockedAt === unlockedAt) {
+        render();
+      }
+    }, delayMs + 50);
     appendLog("info", "queue", `Task ${id.slice(0, 8)} started.`);
   }
   await persistState();

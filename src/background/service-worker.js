@@ -7,6 +7,15 @@ import { createScheduler } from "../core/queue/scheduler.js";
 import { createQueueExecutor } from "../core/queue/executor.js";
 import { buildContinuityRefPatch } from "../core/queue/continuity-chain.js";
 import { activeVideoTaskBeforeComposerRetry } from "../core/queue/video-retry-policy.js";
+import { MessageType, createMessage, isAutoFlowRebuildMessage } from "../core/contracts/messages.js";
+import { createChromeStorageAdapter, createLicenseClient } from "../core/auth/license-client.js";
+import { createFlowClient, extractMediaIds } from "../core/media/flow-client.js";
+import { createPageFlowTransport } from "../core/media/page-flow-transport.js";
+import { createTaskLedger, sanitizeTaskForDebugReport, TaskStatus } from "../core/queue/task-ledger.js";
+import { createScheduler } from "../core/queue/scheduler.js";
+import { createQueueExecutor } from "../core/queue/executor.js";
+import { buildContinuityRefPatch } from "../core/queue/continuity-chain.js";
+import { activeVideoTaskBeforeComposerRetry } from "../core/queue/video-retry-policy.js";
 import { buildGalleryItemsFromTasks, buildPartialVideoCompletionPatch, canonicalGalleryItems, deriveTaskOutputLedger, filterGalleryItemsForProject, filterUsableGalleryItems, planMediaDownloads, reconcileTasksWithDownloadResults, reconcileTasksWithGalleryItems, reconcileTasksWithProjectMediaFeed, referenceMediaIdsFromTasks } from "../core/gallery/media-ledger.js";
 import { buildMediaRedirectUrl, buildMediaThumbnailUrl } from "../core/contracts/api.js";
 import { createDebuggerEngine, releaseDebuggerSessions } from "./debugger-engine.js";
@@ -17,6 +26,7 @@ const runtimeState = {
   bridgeHealthy: false,
   queueRunning: false,
   queueRunToken: 0,
+  singleTaskPlayTaskId: "",
   activeTabId: null,
   projectId: "",
   pageUrl: "",
@@ -3633,7 +3643,7 @@ async function submitTaskWithDebuggerTransport(tabId, task = {}, meta = {}) {
       const error = response?.error || "request_not_observed";
       return {
         ok: false,
-        status: Number(response?.status || 0),
+        status: Number(response.status || 0),
         statusText: /^DOM_DEBUGGER_/i.test(error) ? error : `DOM_DEBUGGER_REQUEST_NOT_OBSERVED:${error}`,
         error: /^DOM_DEBUGGER_/i.test(error) ? error : `DOM_DEBUGGER_REQUEST_NOT_OBSERVED:${error}`,
         data: { prepared, response, transport: "chrome_debugger" }
@@ -3952,6 +3962,9 @@ function stopOverlapTimerIfIdle() {
     clearTimeout(overlapPumpTimeoutId);
     overlapPumpTimeoutId = null;
   }
+  if (!runtimeState.queueRunning) {
+    runtimeState.singleTaskPlayTaskId = "";
+  }
   if (!overlapTimerId) return;
   const hasActive = activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || overlapController.getActiveTasks().length > 0;
   if (hasActive && runtimeState.queueRunning) return;
@@ -3987,6 +4000,7 @@ function resetOverlapStartPace() {
     clearTimeout(overlapPumpTimeoutId);
     overlapPumpTimeoutId = null;
   }
+  runtimeState.singleTaskPlayTaskId = "";
   overlapLastTaskStartedAtMs = 0;
   overlapLastTaskStartedId = "";
   overlapReachedMaxConcurrent = false;
@@ -4082,6 +4096,9 @@ function markOverlapTaskStarted(taskId, config = {}, options = {}) {
 }
 
 function pumpOverlapQueue(tabId) {
+  if (runtimeState.singleTaskPlayTaskId) {
+    return;
+  }
   if (!runtimeState.queueRunning) {
     stopOverlapTimerIfIdle();
     return;
@@ -4493,6 +4510,7 @@ function runSingleQueueTask(taskId, preferredTabId) {
   const runToken = Number(runtimeState.queueRunToken || 0) + 1;
   runtimeState.queueRunToken = runToken;
   runtimeState.queueRunning = true;
+  runtimeState.singleTaskPlayTaskId = String(taskId || "");
   queueStartingTaskId = String(taskId || "");
   startBackgroundDownloadDaemon();
   recordEvent({ type: "queue.task.play", runToken, taskId });
@@ -4573,6 +4591,7 @@ function runSingleQueueTask(taskId, preferredTabId) {
       stopOverlapTimerIfIdle();
       clearQueueStartingTask(taskId);
       await releaseDebuggerSessions("single_task_finished", recordDebuggerTrace);
+      runtimeState.singleTaskPlayTaskId = "";
       if (runtimeState.queueRunToken === runToken) {
         runtimeState.queueRunning = false;
         await persistQueueState();
