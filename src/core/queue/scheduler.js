@@ -205,13 +205,18 @@ export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
       const task = ledger.getTask(taskId);
       const failure = classifyQueueError(error);
       const exhausted = Number(task?.attempts || 0) >= maxAttempts;
-      return ledger.updateTask(taskId, {
-        status: failure.retryable && !exhausted ? TaskStatus.pending : TaskStatus.failed,
+      const status = failure.retryable && !exhausted ? TaskStatus.pending : TaskStatus.failed;
+      const patch = {
+        status,
         lastError: queueErrorText(error),
         failureClass: failure.class,
         healAction: failure.healAction,
         failureScope: failure.scope
-      });
+      };
+      if (status === TaskStatus.failed) {
+        patch.completedAt = new Date().toISOString();
+      }
+      return ledger.updateTask(taskId, patch);
     },
 
     markBlocked(taskId, reason) {
@@ -221,7 +226,8 @@ export function createScheduler({ ledger, maxAttempts = 3 } = {}) {
         lastError: queueErrorText(reason),
         failureClass: failure.class === "unknown" ? "blocked" : failure.class,
         healAction: failure.healAction || "user_action_required",
-        failureScope: failure.scope || "global"
+        failureScope: failure.scope || "global",
+        completedAt: new Date().toISOString()
       });
     }
   };

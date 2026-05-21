@@ -129,6 +129,7 @@ const TERMINAL_TASK_STATUSES = new Set([
 ]);
 
 let nextTaskStartAllowedAtMs = 0;
+let queueRunStartedAtMs = 0;
 
 function randomDelayMs(minSeconds, maxSeconds) {
   const min = Number(minSeconds);
@@ -153,35 +154,56 @@ function armCompletionDelayFromFinishedTasks() {
   if (Math.max(minSeconds, maxSeconds) <= 0) return null;
 
   const nowMs = Date.now();
-  const finishedTask = ledger
+  const finishedTasks = ledger
     .listTasks()
-    .find((task) => {
+    .filter((task) => {
       if (!task?.id) return false;
       if (!isTerminalQueueTask(task)) return false;
       if (task.completionDelayConsumedAt) return false;
+      if (!task.completedAt) return false;
+      const completedMs = Date.parse(task.completedAt);
+      if (!Number.isFinite(completedMs)) return false;
+      if (completedMs < queueRunStartedAtMs) return false;
       return true;
     });
 
-  if (!finishedTask) return null;
+  if (finishedTasks.length === 0) return null;
+
+  let latestTask = finishedTasks[0];
+  let latestCompletedMs = Date.parse(latestTask.completedAt);
+  for (let i = 1; i < finishedTasks.length; i++) {
+    const t = finishedTasks[i];
+    const ms = Date.parse(t.completedAt);
+    if (ms > latestCompletedMs) {
+      latestTask = t;
+      latestCompletedMs = ms;
+    }
+  }
 
   const delayMs = randomDelayMs(minSeconds, maxSeconds);
   const allowedAtMs = nowMs + delayMs;
 
   nextTaskStartAllowedAtMs = Math.max(nextTaskStartAllowedAtMs, allowedAtMs);
 
-  ledger.updateTask(finishedTask.id, {
-    completionDelayConsumedAt: new Date(nowMs).toISOString(),
-    completionDelayUntil: new Date(allowedAtMs).toISOString(),
-    completionDelaySeconds: Number((delayMs / 1000).toFixed(2))
-  });
+  const consumedTimeStr = new Date(nowMs).toISOString();
 
-  logOverlapSubmit("ARM_COMPLETION_DELAY", finishedTask.id, {
-    delaySeconds: Number((delayMs / 1000).toFixed(2)),
-    allowedAt: new Date(allowedAtMs).toISOString()
-  });
+  for (const task of finishedTasks) {
+    const isLatest = task.id === latestTask.id;
+    ledger.updateTask(task.id, {
+      completionDelayConsumedAt: consumedTimeStr,
+      completionDelayUntil: isLatest ? new Date(allowedAtMs).toISOString() : consumedTimeStr,
+      completionDelaySeconds: isLatest ? Number((delayMs / 1000).toFixed(2)) : 0
+    });
+
+    logOverlapSubmit("ARM_COMPLETION_DELAY", task.id, {
+      delaySeconds: isLatest ? Number((delayMs / 1000).toFixed(2)) : 0,
+      allowedAt: isLatest ? new Date(allowedAtMs).toISOString() : consumedTimeStr,
+      isLatest
+    });
+  }
 
   return {
-    taskId: finishedTask.id,
+    taskId: latestTask.id,
     delayMs,
     allowedAtMs
   };
@@ -3795,7 +3817,8 @@ async function recoverGlobalQueueFailure(task = {}, tabId = 0) {
     const blocked = ledger.updateTask(task.id, {
       status: TaskStatus.blocked,
       healAction: "user_action_required",
-      lastError: task.lastError || `${task.failureClass || "global_failure"} recovery exhausted`
+      lastError: task.lastError || `${task.failureClass || "global_failure"} recovery exhausted`,
+      completedAt: new Date().toISOString()
     });
     recordEvent({
       type: "queue.global_recovery.exhausted",
@@ -4381,6 +4404,7 @@ async function runQueueUntilIdle(preferredTabId) {
   const runToken = Number(runtimeState.queueRunToken || 0) + 1;
   runtimeState.queueRunToken = runToken;
   runtimeState.queueRunning = true;
+  queueRunStartedAtMs = Date.now();
   startBackgroundDownloadDaemon();
   const isActiveRun = () => runtimeState.queueRunning && runtimeState.queueRunToken === runToken;
   recordEvent({ type: "queue.start", runToken });
@@ -4421,6 +4445,13 @@ async function runQueueUntilIdle(preferredTabId) {
     const executor = createExecutorForTab(tab.id);
 
     while (isActiveRun()) {
+      armCompletionDelayFromFinishedTasks();
+      const cooldownMs = getQueueStartCooldownRemainingMs();
+      if (cooldownMs > 0) {
+        await sleep(Math.min(cooldownMs, 1000));
+        continue;
+      }
+
       const next = scheduler.nextPendingTask();
       if (!next) {
         const mergedCompletedRepairs = await mergeCompletedVideoRepairTasks("queue_idle_completed_repairs");
@@ -4654,6 +4685,7 @@ function runSingleQueueTask(taskId, preferredTabId) {
   const runToken = Number(runtimeState.queueRunToken || 0) + 1;
   runtimeState.queueRunToken = runToken;
   runtimeState.queueRunning = true;
+  queueRunStartedAtMs = Date.now();
   queueStartingTaskId = String(taskId || "");
   activeTaskRuns.set(taskId, true);
   startBackgroundDownloadDaemon();
