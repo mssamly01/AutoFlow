@@ -76,6 +76,23 @@ function getTaskDelayBaseAtMs(task = {}) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function randomRangeSeconds(minValue, maxValue) {
+  const min = Number(minValue);
+  const max = Number(maxValue);
+  const safeMin = Number.isFinite(min) ? min : 0;
+  const safeMax = Number.isFinite(max) ? max : safeMin;
+  const low = Math.min(safeMin, safeMax);
+  const high = Math.max(safeMin, safeMax);
+  if (high <= low) return low;
+  return low + Math.random() * (high - low);
+}
+
+function parseTimeMs(value) {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function createOverlapController({
   ledger,
   scheduler,
@@ -155,13 +172,41 @@ export function createOverlapController({
       return { ok: false, reason: "missing_delay_base" };
     }
 
-    const elapsedSeconds = Math.max(0, (now() - startedAtMs) / 1000);
+    let unlockAtMs = parseTimeMs(task.nextOverlapUnlockAt);
 
-    if (elapsedSeconds >= config.delayMaxSeconds) {
-      return { ok: true, reason: "timer" };
+    if (!Number.isFinite(unlockAtMs)) {
+      const delaySeconds = randomRangeSeconds(
+        config.delayMinSeconds,
+        config.delayMaxSeconds
+      );
+
+      unlockAtMs = startedAtMs + Math.round(delaySeconds * 1000);
+
+      ledger.updateTask(task.id, {
+        nextOverlapUnlockAt: new Date(unlockAtMs).toISOString(),
+        nextOverlapUnlockDelaySeconds: Number(delaySeconds.toFixed(2))
+      });
     }
 
-    return { ok: false, reason: "waiting", elapsedSeconds, remaining: config.delayMaxSeconds - elapsedSeconds };
+    const remainingSeconds = Math.max(0, (unlockAtMs - now()) / 1000);
+    const elapsedSeconds = Math.max(0, (now() - startedAtMs) / 1000);
+
+    if (remainingSeconds <= 0) {
+      return {
+        ok: true,
+        reason: "timer",
+        elapsedSeconds,
+        delaySeconds: task.nextOverlapUnlockDelaySeconds || config.delayMaxSeconds
+      };
+    }
+
+    return {
+      ok: false,
+      reason: "waiting",
+      elapsedSeconds,
+      remaining: remainingSeconds,
+      delaySeconds: task.nextOverlapUnlockDelaySeconds || config.delayMaxSeconds
+    };
   }
 
   function markUnlockedNext(taskId, reason = "unknown") {

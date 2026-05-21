@@ -118,8 +118,80 @@ let overlapLastTaskStartedId = "";
 let overlapReachedMaxConcurrent = false;
 let overlapNextStartAllowedAtMs = 0;
 let overlapNextStartDelaySeconds = 0;
-let overlapRefillReadyTimesMs = [];
-let overlapRefillDelaySeconds = 0;
+
+const TERMINAL_TASK_STATUSES = new Set([
+  TaskStatus.complete,
+  TaskStatus.failed,
+  TaskStatus.blocked,
+  "done",
+  "cancelled",
+  "canceled"
+]);
+
+let nextTaskStartAllowedAtMs = 0;
+
+function randomDelayMs(minSeconds, maxSeconds) {
+  const min = Number(minSeconds);
+  const max = Number(maxSeconds);
+  const safeMin = Number.isFinite(min) ? Math.max(0, min) : 0;
+  const safeMax = Number.isFinite(max) ? Math.max(0, max) : safeMin;
+  const low = Math.min(safeMin, safeMax);
+  const high = Math.max(safeMin, safeMax);
+  const seconds = high <= low ? low : low + Math.random() * (high - low);
+  return Math.round(seconds * 1000);
+}
+
+function isTerminalQueueTask(task = {}) {
+  return TERMINAL_TASK_STATUSES.has(String(task.status || "").toLowerCase());
+}
+
+function armCompletionDelayFromFinishedTasks() {
+  const config = overlapController.getConfig();
+  const minSeconds = Number(config.completionDelayMinSeconds || 0);
+  const maxSeconds = Number(config.completionDelayMaxSeconds || minSeconds);
+
+  if (Math.max(minSeconds, maxSeconds) <= 0) return null;
+
+  const nowMs = Date.now();
+  const finishedTask = ledger
+    .listTasks()
+    .find((task) => {
+      if (!task?.id) return false;
+      if (!isTerminalQueueTask(task)) return false;
+      if (task.completionDelayConsumedAt) return false;
+      return true;
+    });
+
+  if (!finishedTask) return null;
+
+  const delayMs = randomDelayMs(minSeconds, maxSeconds);
+  const allowedAtMs = nowMs + delayMs;
+
+  nextTaskStartAllowedAtMs = Math.max(nextTaskStartAllowedAtMs, allowedAtMs);
+
+  ledger.updateTask(finishedTask.id, {
+    completionDelayConsumedAt: new Date(nowMs).toISOString(),
+    completionDelayUntil: new Date(allowedAtMs).toISOString(),
+    completionDelaySeconds: Number((delayMs / 1000).toFixed(2))
+  });
+
+  logOverlapSubmit("ARM_COMPLETION_DELAY", finishedTask.id, {
+    delaySeconds: Number((delayMs / 1000).toFixed(2)),
+    allowedAt: new Date(allowedAtMs).toISOString()
+  });
+
+  return {
+    taskId: finishedTask.id,
+    delayMs,
+    allowedAtMs
+  };
+}
+
+function getQueueStartCooldownRemainingMs() {
+  const nowMs = Date.now();
+  return Math.max(0, nextTaskStartAllowedAtMs - nowMs);
+}
+
 const overlapController = createOverlapController({
   ledger,
   scheduler,
@@ -3920,7 +3992,6 @@ function startTaskWatcher(taskId, tabId, options = {}) {
       await persistQueueState();
     } finally {
       activeWatchRuns.delete(taskId);
-      scheduleOverlapRefillDelay(overlapController.getConfig(), taskId, "task_settled");
       if (options.pumpOnSettle !== false) pumpOverlapQueue(tabId);
       if (options.settleQueueOnIdle === true) {
         settleManualQueueIfIdle("manual_overlap_watch_finished").catch(() => {});
@@ -3995,8 +4066,7 @@ function resetOverlapStartPace() {
   overlapReachedMaxConcurrent = false;
   overlapNextStartAllowedAtMs = 0;
   overlapNextStartDelaySeconds = 0;
-  overlapRefillReadyTimesMs = [];
-  overlapRefillDelaySeconds = 0;
+  nextTaskStartAllowedAtMs = 0;
 }
 
 function taskOverlapStartMs(task = {}) {
@@ -4029,28 +4099,6 @@ function scheduleOverlapNextStartDelay(config = {}, baseAtMs = Date.now()) {
   return delaySeconds;
 }
 
-function scheduleOverlapRefillDelay(config = {}, taskId = "", reason = "completion") {
-  const delaySeconds = randomSecondsBetween(config.completionDelayMinSeconds, config.completionDelayMaxSeconds);
-  overlapRefillDelaySeconds = delaySeconds;
-  overlapRefillReadyTimesMs = [
-    ...overlapRefillReadyTimesMs,
-    Date.now() + (delaySeconds * 1000)
-  ]
-    .filter((time) => Number.isFinite(time))
-    .sort((a, b) => a - b);
-  logOverlapSubmit("REFILL_DELAY", taskId, {
-    reason,
-    delaySeconds,
-    completionDelayMinSeconds: config.completionDelayMinSeconds,
-    completionDelayMaxSeconds: config.completionDelayMaxSeconds
-  });
-  return delaySeconds;
-}
-
-function consumeOverlapRefillDelay() {
-  overlapRefillReadyTimesMs = overlapRefillReadyTimesMs.slice(1);
-}
-
 function overlapStartPaceWaitMs(config = {}) {
   const latestStartedAtMs = Math.max(overlapLastTaskStartedAtMs, latestActiveOverlapStartMs());
   if (!latestStartedAtMs) return 0;
@@ -4060,22 +4108,9 @@ function overlapStartPaceWaitMs(config = {}) {
   return Math.max(0, overlapNextStartAllowedAtMs - Date.now());
 }
 
-function overlapRefillWaitMs(config = {}) {
-  overlapRefillReadyTimesMs = overlapRefillReadyTimesMs
-    .filter((time) => Number.isFinite(time))
-    .sort((a, b) => a - b);
-  if (!overlapRefillReadyTimesMs.length) {
-    return 0;
-  }
-  return Math.max(0, (overlapRefillReadyTimesMs[0] || 0) - Date.now());
-}
-
 function markOverlapTaskStarted(taskId, config = {}, options = {}) {
   overlapLastTaskStartedAtMs = Date.now();
   overlapLastTaskStartedId = String(taskId || "");
-  if (options.refillMode || overlapRefillReadyTimesMs.length > 0) {
-    consumeOverlapRefillDelay();
-  }
   if (!options.refillMode) {
     scheduleOverlapNextStartDelay(config, overlapLastTaskStartedAtMs);
   }
@@ -4099,6 +4134,13 @@ function pumpOverlapQueue(tabId) {
     overlapController.maybeUnlockFromTask(task.id);
   }
 
+  armCompletionDelayFromFinishedTasks();
+  const cooldownRemainingMs = getQueueStartCooldownRemainingMs();
+  if (cooldownRemainingMs > 0) {
+    schedulePumpRetry(cooldownRemainingMs, tabId);
+    return;
+  }
+
   const activeTaskIds = new Set(activeTasks.map((task) => String(task.id || "")));
   const inFlightSubmitOnlyCount = [...activeSubmitRuns.keys()]
     .filter((taskId) => !activeTaskIds.has(String(taskId)))
@@ -4116,16 +4158,8 @@ function pumpOverlapQueue(tabId) {
   const refillMode = overlapReachedMaxConcurrent === true;
   if (!refillMode) {
     const startWaitMs = overlapStartPaceWaitMs(config);
-    const refillWaitMs = overlapRefillWaitMs(config);
-    const waitMs = Math.max(startWaitMs, refillWaitMs);
-    if (waitMs > 0) {
-      schedulePumpRetry(waitMs, tabId);
-      return;
-    }
-  } else {
-    const waitMs = overlapRefillWaitMs(config);
-    if (waitMs > 0) {
-      schedulePumpRetry(waitMs, tabId);
+    if (startWaitMs > 0) {
+      schedulePumpRetry(startWaitMs, tabId);
       return;
     }
   }
@@ -4152,8 +4186,6 @@ function pumpOverlapQueue(tabId) {
       selectedStartDelaySeconds: overlapNextStartDelaySeconds,
       completionDelayMinSeconds: config.completionDelayMinSeconds,
       completionDelayMaxSeconds: config.completionDelayMaxSeconds,
-      selectedRefillDelaySeconds: overlapRefillDelaySeconds,
-      pendingRefillDelays: overlapRefillReadyTimesMs.length,
       maxConcurrentTasks: config.maxConcurrentTasks,
       previousTaskId,
       refillMode
@@ -4206,9 +4238,6 @@ function pumpOverlapQueue(tabId) {
         await persistQueueState();
       } finally {
         activeSubmitRuns.delete(task.id);
-        if (!activeWatchRuns.has(task.id)) {
-          scheduleOverlapRefillDelay(overlapController.getConfig(), task.id, "task_finished");
-        }
         pumpOverlapQueue(tabId);
         stopOverlapTimerIfIdle();
       }
