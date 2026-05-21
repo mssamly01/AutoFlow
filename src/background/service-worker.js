@@ -112,9 +112,9 @@ const activeWatchRuns = new Map();
 let queueStartingTaskId = "";
 
 let overlapTimerId = null;
+let overlapPumpTimeoutId = null;
 let overlapLastTaskStartedAtMs = 0;
 let overlapLastTaskStartedId = "";
-let overlapStartedTaskCount = 0;
 let overlapReachedMaxConcurrent = false;
 let overlapNextStartAllowedAtMs = 0;
 let overlapNextStartDelaySeconds = 0;
@@ -125,6 +125,14 @@ const overlapController = createOverlapController({
   scheduler,
   getPresets: () => runtimeState.overlapPresets || {}
 });
+
+function schedulePumpRetry(waitMs, tabId) {
+  if (overlapPumpTimeoutId) clearTimeout(overlapPumpTimeoutId);
+  overlapPumpTimeoutId = setTimeout(() => {
+    overlapPumpTimeoutId = null;
+    pumpOverlapQueue(tabId);
+  }, waitMs);
+}
 
 function logOverlapSubmit(event, taskId, extra = {}) {
   console.info(`[AutoFlow][OverlapSubmit] ${event}`, {
@@ -3940,6 +3948,10 @@ function startOverlapTimer(tabId) {
 }
 
 function stopOverlapTimerIfIdle() {
+  if (overlapPumpTimeoutId) {
+    clearTimeout(overlapPumpTimeoutId);
+    overlapPumpTimeoutId = null;
+  }
   if (!overlapTimerId) return;
   const hasActive = activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || overlapController.getActiveTasks().length > 0;
   if (hasActive && runtimeState.queueRunning) return;
@@ -3971,9 +3983,12 @@ function filterOverlapTasksForSubmitSlots(tasks = [], freeSlots = 0) {
 }
 
 function resetOverlapStartPace() {
+  if (overlapPumpTimeoutId) {
+    clearTimeout(overlapPumpTimeoutId);
+    overlapPumpTimeoutId = null;
+  }
   overlapLastTaskStartedAtMs = 0;
   overlapLastTaskStartedId = "";
-  overlapStartedTaskCount = 0;
   overlapReachedMaxConcurrent = false;
   overlapNextStartAllowedAtMs = 0;
   overlapNextStartDelaySeconds = 0;
@@ -4055,30 +4070,9 @@ function overlapRefillWaitMs(config = {}) {
   return Math.max(0, (overlapRefillReadyTimesMs[0] || 0) - Date.now());
 }
 
-function syncOverlapStartedCountFromLedger(config = {}) {
-  const maxConcurrent = Math.max(1, Number(config.maxConcurrentTasks || 1) || 1);
-  const startedCount = ledger
-    .listTasks()
-    .filter((task) => (
-      task.overlapStartedAt ||
-      task.submitAttemptStartedAt ||
-      task.submittedAt ||
-      [TaskStatus.submitting, TaskStatus.generating, TaskStatus.downloading, TaskStatus.complete].includes(task.status)
-    ))
-    .length;
-  overlapStartedTaskCount = Math.max(overlapStartedTaskCount, Math.min(startedCount, maxConcurrent));
-  if (overlapStartedTaskCount >= maxConcurrent || overlapController.getActiveTasks().length >= maxConcurrent) {
-    overlapReachedMaxConcurrent = true;
-  }
-}
-
 function markOverlapTaskStarted(taskId, config = {}, options = {}) {
   overlapLastTaskStartedAtMs = Date.now();
   overlapLastTaskStartedId = String(taskId || "");
-  overlapStartedTaskCount += 1;
-  if (overlapStartedTaskCount >= Math.max(1, Number(config.maxConcurrentTasks || 1) || 1)) {
-    overlapReachedMaxConcurrent = true;
-  }
   if (options.refillMode) {
     consumeOverlapRefillDelay();
   } else {
@@ -4097,7 +4091,6 @@ function pumpOverlapQueue(tabId) {
   if (!config.enabled) return;
 
   startOverlapTimer(tabId);
-  syncOverlapStartedCountFromLedger(config);
 
   // Proactively check if any active task should unlock the next one.
   const activeTasks = overlapController.getActiveTasks();
@@ -4109,10 +4102,7 @@ function pumpOverlapQueue(tabId) {
   const inFlightSubmitOnlyCount = [...activeSubmitRuns.keys()]
     .filter((taskId) => !activeTaskIds.has(String(taskId)))
     .length;
-  const activeWatchOnlyCount = [...activeWatchRuns.keys()]
-    .filter((taskId) => !activeTaskIds.has(String(taskId)) && !activeSubmitRuns.has(String(taskId)))
-    .length;
-  const totalActiveCount = activeTasks.length + inFlightSubmitOnlyCount + activeWatchOnlyCount;
+  const totalActiveCount = activeTasks.length + inFlightSubmitOnlyCount;
   const freeSlots = Math.max(0, config.maxConcurrentTasks - totalActiveCount);
   if (totalActiveCount >= config.maxConcurrentTasks) {
     overlapReachedMaxConcurrent = true;
@@ -4122,10 +4112,16 @@ function pumpOverlapQueue(tabId) {
   const refillMode = overlapReachedMaxConcurrent === true;
   if (!refillMode) {
     const waitMs = overlapStartPaceWaitMs(config);
-    if (waitMs > 0) return;
+    if (waitMs > 0) {
+      schedulePumpRetry(waitMs, tabId);
+      return;
+    }
   } else {
     const waitMs = overlapRefillWaitMs(config);
-    if (waitMs > 0) return;
+    if (waitMs > 0) {
+      schedulePumpRetry(waitMs, tabId);
+      return;
+    }
   }
 
   const tasks = overlapController.pickNextTasksToStart(1);

@@ -4391,6 +4391,7 @@ async function enqueueAndRun() {
     state.ui.activeRoute = "live";
     state.ui.galleryTab = state.control.mode === FLOW_MODES.textToImage ? "images" : "videos";
     const preparingPrompts = jobPromptLinesForRun();
+    showLocalPreparingQueue(preparingPrompts);
     appendLog("info", "queue", `Preparing ${preparingPrompts.length} prompt${preparingPrompts.length === 1 ? "" : "s"} for ${state.ui.galleryTab}.`);
     render();
     await nextAnimationFrame();
@@ -4449,10 +4450,6 @@ async function requestEnqueueAndRun() {
   if (enqueueAndRunInFlight) return;
   enqueueAndRunInFlight = true;
   try {
-    state.ui.activeRoute = "live";
-    state.ui.galleryTab = state.control.mode === FLOW_MODES.textToImage ? "images" : "videos";
-    render();
-    await nextAnimationFrame();
     await enqueueAndRun();
   } finally {
     enqueueAndRunInFlight = false;
@@ -4534,6 +4531,33 @@ function modeHasAnyReference(currentState = state) {
       || splitIds(refs.omniRefRefs).length > 0;
   }
   return false;
+}
+
+function showLocalPreparingQueue(prompts = []) {
+  const settings = taskSettingsForMode(state.control.mode);
+  const isImage = state.control.mode === FLOW_MODES.textToImage;
+  const repeatSlotMode = state.control.mode === FLOW_MODES.imageToVideo && imageToVideoRepeatFirstSlotCount() > 1;
+  const expectedCount = Math.max(1, Number(settings.repeatCount || 1));
+  const jobId = `local-preparing-${Date.now()}`;
+  state.queue.running = true;
+  state.queue.items = prompts.map((prompt, index) => ({
+    id: `${jobId}-${index}`,
+    jobId,
+    jobIndex: index,
+    jobPromptCount: prompts.length,
+    jobTitle: queueBatchTitle(state.control.mode, prompts.length),
+    prompt,
+    mode: state.control.mode,
+    status: "pending",
+    submitPath: state.control.presets.submitPath,
+    submitPathPreference: state.control.presets.submitPath,
+    repeatCount: expectedCount,
+    repeatSlotMode: repeatSlotMode ? "repeat_first_reference" : "",
+    expectedImages: isImage ? expectedCount : 0,
+    expectedVideos: isImage ? 0 : expectedCount,
+    download: settings.download || {},
+    localPreparing: true
+  }));
 }
 
 function nextAnimationFrame() {
