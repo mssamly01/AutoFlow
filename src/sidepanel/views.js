@@ -1684,6 +1684,7 @@ function liveQueueStep(iconName, label, active) {
 }
 
 function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), options = {}, locale = "en") {
+  const rawStatus = String(item.status || "pending");
   const status = liveQueueEffectiveStatus(item, options);
   const label = liveQueueStatusLabel(item, options);
   const prompt = String(item.prompt || item.id || "Untitled task");
@@ -1703,7 +1704,8 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
   // backend payload that drove the truncation.
   const isErrorState = status === "failed" || status === "blocked";
   const activityTitle = isErrorState ? (liveQueueErrorTooltip(item) || label) : label;
-  const canPlaySingle = Boolean(item?.id) && !options.queueRunning && status === "pending" && item.localPreparing !== true;
+  const canPlaySingle = Boolean(item?.id) && rawStatus === "pending" && item.localPreparing !== true;
+  const playSingleDisabled = options.queueRunning === true;
   const canStopSingle = Boolean(item?.id) && options.queueRunning && ["submitting", "generating", "downloading"].includes(status);
   return el("div", { class: `live-queue-task is-${groupStatusClass([item], options)}` },
     el("span", { class: "live-task-index", text: String(index + 1).padStart(2, "0") }),
@@ -1719,7 +1721,7 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
         ? el("button", {
           class: "live-task-play",
           data: { livePlayTaskId: String(item.id || "") },
-          attrs: { type: "button", title: "Play this task", "aria-label": "Play this task" }
+          attrs: { type: "button", title: "Play this task", "aria-label": "Play this task", disabled: playSingleDisabled ? "disabled" : null }
         }, icon("play_arrow"))
         : canStopSingle
           ? el("button", {
