@@ -118,6 +118,7 @@ let overlapLastTaskStartedId = "";
 let overlapReachedMaxConcurrent = false;
 let overlapNextStartAllowedAtMs = 0;
 let overlapNextStartDelaySeconds = 0;
+let overlapCompletionAllowedAtMs = 0;
 
 const TERMINAL_TASK_STATUSES = new Set([
   TaskStatus.complete,
@@ -197,7 +198,8 @@ function armCompletionDelayFromFinishedTasks() {
   const delayMs = Math.round(delaySeconds * 1000);
   const allowedAtMs = nowMs + delayMs;
 
-  overlapNextStartAllowedAtMs = Math.max(overlapNextStartAllowedAtMs || 0, allowedAtMs);
+  // Use a dedicated variable so completion delay is never overwritten by start delay logic.
+  overlapCompletionAllowedAtMs = Math.max(overlapCompletionAllowedAtMs || 0, allowedAtMs);
 
   const consumedTimeStr = new Date(nowMs).toISOString();
 
@@ -4098,6 +4100,7 @@ function resetOverlapStartPace() {
   overlapReachedMaxConcurrent = false;
   overlapNextStartAllowedAtMs = 0;
   overlapNextStartDelaySeconds = 0;
+  overlapCompletionAllowedAtMs = 0;
 }
 
 function taskOverlapStartMs(task = {}) {
@@ -4166,9 +4169,9 @@ function pumpOverlapQueue(tabId) {
   }
 
   armCompletionDelayFromFinishedTasks();
-  const remainingMs = overlapNextStartAllowedAtMs - Date.now();
-  if (remainingMs > 0) {
-    schedulePumpRetry(remainingMs, tabId);
+  const completionRemainingMs = overlapCompletionAllowedAtMs - Date.now();
+  if (completionRemainingMs > 0) {
+    schedulePumpRetry(completionRemainingMs, tabId);
     return;
   }
 
@@ -4454,9 +4457,9 @@ async function runQueueUntilIdle(preferredTabId) {
 
     while (isActiveRun()) {
       armCompletionDelayFromFinishedTasks();
-      const remainingMs = overlapNextStartAllowedAtMs - Date.now();
-      if (remainingMs > 0) {
-        await sleep(Math.min(remainingMs, 1000));
+      const completionRemainingMs = overlapCompletionAllowedAtMs - Date.now();
+      if (completionRemainingMs > 0) {
+        await sleep(Math.min(completionRemainingMs, 1000));
         continue;
       }
 
