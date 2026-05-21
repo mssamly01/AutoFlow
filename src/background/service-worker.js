@@ -4253,7 +4253,7 @@ function manualOverlapStartDecision(task = {}) {
 
 async function settleManualQueueIfIdle(reason = "manual_overlap_idle") {
   if (!runtimeState.queueRunning) return false;
-  if (activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || hasActiveTasks()) return false;
+  if (activeTaskRuns.size > 0 || activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || hasActiveTasks()) return false;
   stopOverlapTimerIfIdle();
   clearQueueStartingTask();
   await releaseDebuggerSessions(reason, recordDebuggerTrace);
@@ -4617,10 +4617,12 @@ async function runQueueUntilIdle(preferredTabId) {
 
 function runSingleQueueTask(taskId, preferredTabId) {
   if (runtimeState.queueRunning) return false;
+  if (activeTaskRuns.has(taskId)) return false;
   const runToken = Number(runtimeState.queueRunToken || 0) + 1;
   runtimeState.queueRunToken = runToken;
   runtimeState.queueRunning = true;
   queueStartingTaskId = String(taskId || "");
+  activeTaskRuns.set(taskId, true);
   startBackgroundDownloadDaemon();
   recordEvent({ type: "queue.task.play", runToken, taskId });
 
@@ -4699,8 +4701,9 @@ function runSingleQueueTask(taskId, preferredTabId) {
     } finally {
       stopOverlapTimerIfIdle();
       clearQueueStartingTask(taskId);
+      activeTaskRuns.delete(taskId);
       if (runtimeState.queueRunToken === runToken) {
-        if (activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || hasActiveTasks()) {
+        if (activeTaskRuns.size > 0 || activeSubmitRuns.size > 0 || activeWatchRuns.size > 0 || hasActiveTasks()) {
           await persistQueueState();
           recordEvent({ type: "queue.task.play_keep_running", runToken, taskId });
           return;
