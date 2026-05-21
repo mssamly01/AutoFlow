@@ -128,8 +128,18 @@ const TERMINAL_TASK_STATUSES = new Set([
   "canceled"
 ]);
 
-let nextTaskStartAllowedAtMs = 0;
 let queueRunStartedAtMs = 0;
+
+function randomRangeSeconds(minValue, maxValue) {
+  const min = Number(minValue);
+  const max = Number(maxValue);
+  const safeMin = Number.isFinite(min) ? min : 0;
+  const safeMax = Number.isFinite(max) ? max : safeMin;
+  const low = Math.min(safeMin, safeMax);
+  const high = Math.max(safeMin, safeMax);
+  if (high <= low) return low;
+  return low + Math.random() * (high - low);
+}
 
 function randomDelayMs(minSeconds, maxSeconds) {
   const min = Number(minSeconds);
@@ -180,10 +190,14 @@ function armCompletionDelayFromFinishedTasks() {
     }
   }
 
-  const delayMs = randomDelayMs(minSeconds, maxSeconds);
+  const delaySeconds = randomRangeSeconds(
+    config.completionDelayMinSeconds,
+    config.completionDelayMaxSeconds
+  );
+  const delayMs = Math.round(delaySeconds * 1000);
   const allowedAtMs = nowMs + delayMs;
 
-  nextTaskStartAllowedAtMs = Math.max(nextTaskStartAllowedAtMs, allowedAtMs);
+  overlapNextStartAllowedAtMs = Math.max(overlapNextStartAllowedAtMs || 0, allowedAtMs);
 
   const consumedTimeStr = new Date(nowMs).toISOString();
 
@@ -192,11 +206,11 @@ function armCompletionDelayFromFinishedTasks() {
     ledger.updateTask(task.id, {
       completionDelayConsumedAt: consumedTimeStr,
       completionDelayUntil: isLatest ? new Date(allowedAtMs).toISOString() : consumedTimeStr,
-      completionDelaySeconds: isLatest ? Number((delayMs / 1000).toFixed(2)) : 0
+      completionDelaySeconds: isLatest ? Number(delaySeconds.toFixed(2)) : 0
     });
 
     logOverlapSubmit("ARM_COMPLETION_DELAY", task.id, {
-      delaySeconds: isLatest ? Number((delayMs / 1000).toFixed(2)) : 0,
+      delaySeconds: isLatest ? Number(delaySeconds.toFixed(2)) : 0,
       allowedAt: isLatest ? new Date(allowedAtMs).toISOString() : consumedTimeStr,
       isLatest
     });
@@ -207,11 +221,6 @@ function armCompletionDelayFromFinishedTasks() {
     delayMs,
     allowedAtMs
   };
-}
-
-function getQueueStartCooldownRemainingMs() {
-  const nowMs = Date.now();
-  return Math.max(0, nextTaskStartAllowedAtMs - nowMs);
 }
 
 const overlapController = createOverlapController({
@@ -4089,7 +4098,6 @@ function resetOverlapStartPace() {
   overlapReachedMaxConcurrent = false;
   overlapNextStartAllowedAtMs = 0;
   overlapNextStartDelaySeconds = 0;
-  nextTaskStartAllowedAtMs = 0;
 }
 
 function taskOverlapStartMs(task = {}) {
@@ -4158,9 +4166,9 @@ function pumpOverlapQueue(tabId) {
   }
 
   armCompletionDelayFromFinishedTasks();
-  const cooldownRemainingMs = getQueueStartCooldownRemainingMs();
-  if (cooldownRemainingMs > 0) {
-    schedulePumpRetry(cooldownRemainingMs, tabId);
+  const remainingMs = overlapNextStartAllowedAtMs - Date.now();
+  if (remainingMs > 0) {
+    schedulePumpRetry(remainingMs, tabId);
     return;
   }
 
@@ -4446,9 +4454,9 @@ async function runQueueUntilIdle(preferredTabId) {
 
     while (isActiveRun()) {
       armCompletionDelayFromFinishedTasks();
-      const cooldownMs = getQueueStartCooldownRemainingMs();
-      if (cooldownMs > 0) {
-        await sleep(Math.min(cooldownMs, 1000));
+      const remainingMs = overlapNextStartAllowedAtMs - Date.now();
+      if (remainingMs > 0) {
+        await sleep(Math.min(remainingMs, 1000));
         continue;
       }
 
