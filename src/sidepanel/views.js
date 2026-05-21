@@ -1339,8 +1339,6 @@ function queueGroups(items = [], options = {}) {
     return {
       ...group,
       queueRunning,
-      singleTaskPlayTaskId: String(options.singleTaskPlayTaskId || ""),
-      singleTaskPlayUnlockedAt: Number(options.singleTaskPlayUnlockedAt || 0),
       title: first.jobTitle || `${modeLabel(first.mode, locale)} - ${group.items.length} prompt${group.items.length === 1 ? "" : "s"}`,
       preview: first.prompt || first.id || "Untitled job",
       statusClass: groupStatusClass(group.items, { queueRunning }),
@@ -1519,7 +1517,7 @@ function renderGalleryHowTo(active, locale = "en") {
 function renderLiveQueueGallery(state, selected = new Set(), options = {}) {
   const locale = state.control?.presets?.language || "en";
   const referenceLookup = buildLiveQueueReferenceLookup(state);
-  const allGroups = queueGroups(state.queue.items, { queueRunning: state.queue?.running === true, singleTaskPlayTaskId: String(state.queue?.singleTaskPlayTaskId || ""), singleTaskPlayUnlockedAt: Number(state.queue?.singleTaskPlayUnlockedAt || 0), locale });
+  const allGroups = queueGroups(state.queue.items, { queueRunning: state.queue?.running === true, locale });
   const activeGroups = allGroups.filter((group) => group.statusClass !== "done");
   const groups = options.showAllGroups
     ? (activeGroups.length ? activeGroups : allGroups)
@@ -1538,7 +1536,7 @@ function renderLiveQueueGallery(state, selected = new Set(), options = {}) {
           el("span", { class: "q-status", text: group.statusLabel })
         ),
         el("div", { class: "live-queue-task-list" },
-          group.items.map((item, index) => renderLiveQueueTaskRow(item, index, selected, { queueRunning: group.queueRunning, singleTaskPlayTaskId: group.singleTaskPlayTaskId || "", singleTaskPlayUnlockedAt: group.singleTaskPlayUnlockedAt || 0, referenceLookup }, locale))
+          group.items.map((item, index) => renderLiveQueueTaskRow(item, index, selected, { queueRunning: group.queueRunning, referenceLookup }, locale))
         )
       ))
       : el("div", { class: "gallery-empty", text: translate("noLiveQueueItems", {}, locale) })
@@ -1705,15 +1703,7 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
   // backend payload that drove the truncation.
   const isErrorState = status === "failed" || status === "blocked";
   const activityTitle = isErrorState ? (liveQueueErrorTooltip(item) || label) : label;
-  const isSingleTaskMode = Boolean(options.singleTaskPlayTaskId);
-  const isThisTaskRunning = isSingleTaskMode && String(item?.id || "") === options.singleTaskPlayTaskId;
-  const overlapDelayActive = isSingleTaskMode && options.queueRunning
-    && Number(options.singleTaskPlayUnlockedAt || 0) > Date.now();
-  // In single-task play mode, tasks may show "waiting" status (because queueRunning=true),
-  // but they should still show the play button (disabled during delay, enabled after).
-  const isPlayableStatus = status === "pending" || (isSingleTaskMode && !isThisTaskRunning && status === "waiting");
-  const canPlaySingle = Boolean(item?.id) && isPlayableStatus && item.localPreparing !== true
-    && (!options.queueRunning || (isSingleTaskMode && !isThisTaskRunning));
+  const canPlaySingle = Boolean(item?.id) && !options.queueRunning && status === "pending" && item.localPreparing !== true;
   const canStopSingle = Boolean(item?.id) && options.queueRunning && ["submitting", "generating", "downloading"].includes(status);
   return el("div", { class: `live-queue-task is-${groupStatusClass([item], options)}` },
     el("span", { class: "live-task-index", text: String(index + 1).padStart(2, "0") }),
@@ -1729,7 +1719,7 @@ function renderLiveQueueTaskRow(item = {}, index = 0, selected = new Set(), opti
         ? el("button", {
           class: "live-task-play",
           data: { livePlayTaskId: String(item.id || "") },
-          attrs: { type: "button", title: "Play this task", "aria-label": "Play this task", disabled: overlapDelayActive ? "disabled" : null }
+          attrs: { type: "button", title: "Play this task", "aria-label": "Play this task" }
         }, icon("play_arrow"))
         : canStopSingle
           ? el("button", {
