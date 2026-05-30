@@ -10,6 +10,7 @@ import {
 import { renumberSceneClips, sceneGallerySelectionIds, totalSceneDuration } from "../core/gallery/scene-builder.js";
 import { buildAutopilotF2VSeedsFromTasks } from "../core/queue/autopilot-pipeline.js";
 import { base64FromDataUrl, getReferenceBlob, putReferenceBlob } from "../core/storage/reference-blob-store.js";
+import { buildCharacterAssetLedger, scanCharacterMentions, validateCharacterRun } from "../core/characters/character-prompts.js";
 import { FLOW_MODES, STORAGE_KEY, createDefaultState, mergeState } from "./runtime-config.js";
 import { renderControl, renderGallery, renderHistory, renderLiveQueue, renderLogs, renderScenes, renderSettings } from "./views.js";
 import { createGalleryController } from "./gallery-controller.js";
@@ -1462,24 +1463,30 @@ function bindAfterControl(root) {
   bindTextInput(root, "#prompts", (value) => {
     state.control.livePrompt = value;
   }, { rerenderMap: true });
+  bindTextInput(root, "#characterPrompts", (value) => {
+    state.control.characterPromptText = value;
+  });
   root.querySelectorAll("[data-ref-clear]").forEach((button) => {
     button.addEventListener("click", () => clearReference(button.dataset.refClear));
   });
   root.querySelector("#captureButton")?.addEventListener("click", () => captureFlowProject());
   root.querySelector("#referenceUploadButton")?.addEventListener("click", () => openReferenceUpload(root));
   root.querySelector("#addRefsToLibraryButton")?.addEventListener("click", () => openReferenceLibraryUpload(root));
+  root.querySelector("#characterSourceUploadButton")?.addEventListener("click", () => openCharacterSourceUpload(root));
   root.querySelector("#uploadRefImageBtn")?.addEventListener("click", () => openReferenceUpload(root));
   root.querySelector("#refImageInput")?.addEventListener("change", (event) => {
     const input = event.target;
     const files = input.files;
     const libraryOnly = refImportIntent === "library_only";
-    const intent = libraryOnly
+    const characterSourceOnly = refImportIntent === "character_source";
+    const importOnly = libraryOnly || characterSourceOnly;
+    const intent = importOnly
       ? refImportIntent
       : (refImportIntent === "library" ? (state.control.activeApplyMode || "shared") : refImportIntent);
     importReferenceFiles(files, {
       intent,
-      activate: libraryOnly ? false : intent === "shared" || intent === "library" || intent === "match" || intent === "chain" || intent === "chain_match",
-      saveToLibrary: libraryOnly ? true : undefined
+      activate: importOnly ? false : intent === "shared" || intent === "library" || intent === "match" || intent === "chain" || intent === "chain_match",
+      saveToLibrary: importOnly ? true : undefined
     });
     refImportIntent = "library";
     input.value = "";
@@ -1497,6 +1504,12 @@ function bindAfterControl(root) {
       event.stopPropagation();
       deleteReferenceImage(button.dataset.refDeleteId);
     });
+  });
+  root.querySelectorAll("[data-character-source-ref-handle]").forEach((button) => {
+    button.addEventListener("click", () => selectCharacterSourceRef(button.dataset.characterSourceRefHandle, button.dataset.characterSourceRefId));
+  });
+  root.querySelectorAll("[data-character-source-clear]").forEach((button) => {
+    button.addEventListener("click", () => clearCharacterSourceRef(button.dataset.characterSourceClear));
   });
   root.querySelector("#promptMapToggle")?.addEventListener("change", async (event) => {
     state.control.presets.mapLineRefs = event.target.checked;
@@ -1543,6 +1556,9 @@ function bindAfterControl(root) {
   root.querySelector("#uploadPromptButton")?.addEventListener("click", () => root.querySelector("#fileInput")?.click());
   root.querySelector("#pastePromptButton")?.addEventListener("click", () => pastePromptFromClipboard());
   root.querySelector("#fileInput")?.addEventListener("change", (event) => importPromptTextFile(event.target));
+  root.querySelector("#uploadCharacterPromptButton")?.addEventListener("click", () => root.querySelector("#characterPromptFileInput")?.click());
+  root.querySelector("#pasteCharacterPromptButton")?.addEventListener("click", () => pasteCharacterPromptFromClipboard());
+  root.querySelector("#characterPromptFileInput")?.addEventListener("change", (event) => importCharacterPromptTextFile(event.target));
   root.querySelector("#uploadImageButton")?.addEventListener("click", () => openReferenceUpload(root, "shared"));
   root.querySelector("#uploadImageOneTimeButton")?.addEventListener("click", () => root.querySelector("#imageInput")?.click());
   root.querySelector("#imageInput")?.addEventListener("change", (event) => importOneToOneBatchReferences(event.target));
@@ -1686,11 +1702,16 @@ function buildRunHistorySnapshot() {
     control: {
       mode: state.control.mode,
       livePrompt: promptsText,
+      characterPromptText: String(state.control.characterPromptText || ""),
+      promptTab: String(state.control.promptTab || "workflow_prompts"),
+      referencesTab: String(state.control.referencesTab || "prompt_references"),
+      runMappingTab: String(state.control.runMappingTab || "prompt_mapping"),
       wizardStep: Number(state.control.wizardStep || 1),
       promptMapOpen: Boolean(state.control.promptMapOpen),
       promptMapFullscreen: false,
       promptRefMap: structuredClone(state.control.promptRefMap || {}),
       oneToOneBatchRefIds: [...oneToOneBatchRefIds()],
+      characterSources: structuredClone(state.control.characterSources || {}),
       references: structuredClone(state.control.references || {}),
       activeApplyMode: String(state.control.activeApplyMode || "shared"),
       presets: structuredClone(state.control.presets || {})
@@ -2019,6 +2040,19 @@ async function updateSettingFromField(field) {
   const key = field.dataset.settingKey;
   if (!key) return;
   let value = field.type === "checkbox" ? field.checked : field.value;
+  if (String(key).startsWith("characterSource:")) {
+    const [, handle, sourceKey] = String(key).split(":");
+    if (handle && sourceKey) {
+      state.control.characterSources ||= {};
+      state.control.characterSources[handle] = {
+        ...(state.control.characterSources[handle] || {}),
+        [sourceKey]: value
+      };
+      await persistState();
+      render();
+    }
+    return;
+  }
   if (key === "videoLength" && (state.control.mode === FLOW_MODES.ingredientsToVideo || state.control.mode === FLOW_MODES.imageToVideo)) {
     value = "8";
   }
@@ -2124,6 +2158,117 @@ function openReferenceLibraryUpload(root) {
   }
   refImportIntent = "library_only";
   clickFileInputWithoutScroll(root.querySelector("#refImageInput"));
+}
+
+function openCharacterSourceUpload(root) {
+  refImportIntent = "character_source";
+  clickFileInputWithoutScroll(root.querySelector("#refImageInput"));
+}
+
+function setCharacterSourceRef(handle = "", item = null) {
+  const cleanHandle = String(handle || "").trim().toLowerCase();
+  const cleanRefId = String(item?.id || "").trim();
+  if (!cleanHandle || !cleanRefId) return false;
+  state.control.characterSources ||= {};
+  state.control.characterSources[cleanHandle] = {
+    ...(state.control.characterSources[cleanHandle] || {}),
+    sourceMode: "reference_library",
+    sourceRefId: cleanRefId,
+    sourceMediaId: String(item?.mediaId || ""),
+    status: "ready"
+  };
+  return true;
+}
+
+async function selectCharacterSourceRef(handle = "", refId = "") {
+  const cleanHandle = String(handle || "").trim().toLowerCase();
+  const cleanRefId = String(refId || "").trim();
+  if (!cleanHandle || !cleanRefId) return;
+  const item = [...(state.control.transientReferenceItems || []), ...(state.referenceLibrary?.savedItems || [])]
+    .find((ref) => String(ref?.id || "") === cleanRefId);
+  if (!setCharacterSourceRef(cleanHandle, item)) return;
+  appendLog("info", "characters", `Selected source image for @${cleanHandle}.`);
+  await persistState();
+  render();
+}
+
+async function clearCharacterSourceRef(handle = "") {
+  const cleanHandle = String(handle || "").trim().toLowerCase();
+  if (!cleanHandle) return;
+  state.control.characterSources ||= {};
+  state.control.characterSources[cleanHandle] = {
+    ...(state.control.characterSources[cleanHandle] || {}),
+    sourceRefId: "",
+    sourceMediaId: "",
+    status: ""
+  };
+  appendLog("info", "characters", `Cleared source image for @${cleanHandle}.`);
+  await persistState();
+  render();
+}
+
+function characterSourceMatchKey(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/^@+/, "")
+    .replace(/\.[a-z0-9]{2,6}$/i, "")
+    .replace(/[_\-.]+/g, " ")
+    .replace(/[^a-z0-9\s-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function characterIntentsForSourceAssignment() {
+  if (state.control?.mode !== FLOW_MODES.textToImage) return [];
+  const parsed = validateCharacterRun(promptLines(), state.control.characterPromptText, {
+    voiceCatalog: state.characters?.voiceCatalog || {},
+    storeInFlow: state.characters?.storeInFlow === true
+  });
+  return Array.isArray(parsed.intents) ? parsed.intents : [];
+}
+
+function autoAssignCharacterSourceUploads(items = []) {
+  const added = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (!added.length) return 0;
+  const intents = characterIntentsForSourceAssignment();
+  if (!intents.length) {
+    appendLog("warn", "characters", "Uploaded character source image, but no @character is defined yet.");
+    return 0;
+  }
+  const assigned = new Set();
+  let count = 0;
+  const existingSources = state.control.characterSources || {};
+  const handleEntries = intents.map((intent, index) => {
+    const handle = String(intent.handle || "").trim().toLowerCase();
+    return {
+      index,
+      handle,
+      display: String(intent.displayName || handle || ""),
+      handleKey: characterSourceMatchKey(handle),
+      displayKey: characterSourceMatchKey(intent.displayName || handle)
+    };
+  }).filter((entry) => entry.handle);
+
+  for (const [itemIndex, item] of added.entries()) {
+    const nameKey = characterSourceMatchKey(cleanNameFromFileName(item.fileName || item.title || item.name || item.id || ""));
+    const exact = handleEntries.find((entry) =>
+      !assigned.has(entry.handle) &&
+      nameKey &&
+      (nameKey.includes(entry.handleKey) || nameKey.includes(entry.displayKey) || entry.displayKey.includes(nameKey))
+    );
+    const byOrder = added.length === handleEntries.length ? handleEntries[itemIndex] : null;
+    const fallback = handleEntries.find((entry) => !assigned.has(entry.handle) && !existingSources[entry.handle]?.sourceRefId);
+    const target = exact || (byOrder && !assigned.has(byOrder.handle) ? byOrder : null) || (handleEntries.length === 1 ? handleEntries[0] : fallback);
+    if (!target?.handle || assigned.has(target.handle)) continue;
+    if (setCharacterSourceRef(target.handle, item)) {
+      assigned.add(target.handle);
+      count += 1;
+    }
+  }
+  if (count > 0) {
+    appendLog("info", "characters", `Auto-assigned ${count} character source image${count === 1 ? "" : "s"}.`);
+  }
+  return count;
 }
 
 function activeReferenceRoleForMode() {
@@ -2955,6 +3100,9 @@ async function importReferenceFiles(fileList, options = {}) {
   } else {
     state.control.activeApplyMode = priorApplyMode;
   }
+  if (importIntent === "character_source") {
+    autoAssignCharacterSourceUploads(added);
+  }
   if (options.activate !== false) activateImportedReferences(added);
   if (importIntent === "match") {
     state.control.presets.mapLineRefs = true;
@@ -3028,6 +3176,33 @@ async function pastePromptFromClipboard() {
   state.control.livePrompt = String(text || "").trim();
   state.control.promptMapOpen = state.control.presets.mapLineRefs === true;
   appendLog("info", "input", "Pasted prompts from clipboard.");
+  await persistState();
+  render();
+}
+
+async function importCharacterPromptTextFile(input) {
+  const file = input?.files?.[0];
+  if (input) input.value = "";
+  if (!file) return;
+  const text = await file.text();
+  state.control.characterPromptText = String(text || "").trim();
+  state.control.promptTab = "character_prompts";
+  appendLog("info", "characters", `Imported character prompt file ${file.name || "characters.txt"}.`);
+  await persistState();
+  render();
+}
+
+async function pasteCharacterPromptFromClipboard() {
+  const text = await navigator.clipboard?.readText?.().catch(() => "");
+  if (!text) {
+    appendLog("warn", "characters", "Clipboard character prompt paste was unavailable.");
+    await persistState();
+    render();
+    return;
+  }
+  state.control.characterPromptText = String(text || "").trim();
+  state.control.promptTab = "character_prompts";
+  appendLog("info", "characters", "Pasted character prompts from clipboard.");
   await persistState();
   render();
 }
@@ -3284,6 +3459,124 @@ function firstInputValue(selectors) {
 
 function promptLines() {
   return String(state.control.livePrompt || "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
+}
+
+function promptsHaveCharacterMentions(prompts = []) {
+  return (Array.isArray(prompts) ? prompts : [prompts]).some((prompt) => scanCharacterMentions(prompt).length > 0);
+}
+
+function characterFeatureActive(prompts = promptLines()) {
+  return state.control?.mode === FLOW_MODES.textToImage
+    && (
+      String(state.control.characterPromptText || "").trim().length > 0 ||
+      promptsHaveCharacterMentions(prompts)
+    );
+}
+
+function characterPreflightForPrompts(prompts = promptLines()) {
+  const active = characterFeatureActive(prompts);
+  if (!active) {
+    return {
+      active: false,
+      ok: true,
+      intents: [],
+      errors: [],
+      warnings: [],
+      scenes: [],
+      usedHandles: [],
+      undefinedHandles: [],
+      assets: []
+    };
+  }
+  const validation = validateCharacterRun(prompts, state.control.characterPromptText, {
+    voiceCatalog: state.characters?.voiceCatalog || {},
+    storeInFlow: state.characters?.storeInFlow === true
+  });
+  const characterSourceMappings = buildCharacterSourceMappings(validation.intents);
+  const ledger = buildCharacterAssetLedger(validation.intents, {
+    runId: `run:${Date.now()}`,
+    storeInFlow: state.characters?.storeInFlow === true,
+    explicitMappings: [...(state.characters?.savedMappings || []), ...characterSourceMappings]
+  });
+  const errors = [...(validation.errors || []), ...(ledger.errors || [])];
+  return {
+    ...validation,
+    active: true,
+    ok: errors.length === 0,
+    errors,
+    assets: ledger.assets,
+    ledgerErrors: ledger.errors || []
+  };
+}
+
+function buildCharacterSourceMappings(intents = []) {
+  const refs = [...(state.control.transientReferenceItems || []), ...(state.referenceLibrary?.savedItems || [])];
+  const byId = new Map(refs.map((item) => [String(item?.id || ""), item]));
+  return (intents || []).map((intent) => {
+    const handle = String(intent?.handle || "").trim().toLowerCase();
+    if (!handle) return null;
+    const source = state.control.characterSources?.[handle] || {};
+    const sourceMode = String(source.sourceMode || "").trim();
+    const sourceRefId = String(source.sourceRefId || "").trim();
+    const item = sourceRefId ? byId.get(sourceRefId) : null;
+    const sourceMediaId = String(source.sourceMediaId || item?.mediaId || "").trim();
+    const flowCharacterId = String(source.flowCharacterId || "").trim();
+    if (!sourceMode && !sourceRefId && !sourceMediaId && !flowCharacterId) return null;
+    return {
+      handle,
+      sourceMode: sourceRefId ? "reference_library" : sourceMode,
+      sourceRefId,
+      sourceMediaId,
+      sourceHash: String(item?.blobStoreId || item?.id || ""),
+      flowCharacterId,
+      requestedVoice: String(source.requestedVoice || ""),
+      state: source.status || (sourceRefId || flowCharacterId ? "validated" : "")
+    };
+  }).filter(Boolean);
+}
+
+function assertCharacterPreflightOk(preflight = characterPreflightForPrompts()) {
+  if (preflight.active !== true) return preflight;
+  if (preflight.ok) return preflight;
+  const first = preflight.errors?.[0] || {};
+  throw new Error(first.message || first.code || "Character preflight failed.");
+}
+
+function characterMetadataForJob(preflight = {}, promptIndex = 0) {
+  if (preflight.active !== true) {
+    return {
+      characterPromptText: "",
+      characterIntents: [],
+      characterAssets: [],
+      characterMetadata: null,
+      nativeCharacterMentions: null
+    };
+  }
+  const scene = (preflight.scenes || [])[promptIndex] || {};
+  const requiredHandles = Array.isArray(scene.requiredCharacters) ? scene.requiredCharacters : [];
+  const assets = (preflight.assets || []).filter((asset) => requiredHandles.includes(asset.handle));
+  return {
+    characterPromptText: String(state.control.characterPromptText || ""),
+    characterIntents: preflight.intents || [],
+    characterAssets: assets,
+    characterMetadata: {
+      active: true,
+      bindingMode: "native_flow_chip_preferred",
+      fallbackMode: "plain_text_prompt",
+      requiredHandles,
+      parser: {
+        characterCount: preflight.intents?.length || 0,
+        usedHandles: preflight.usedHandles || [],
+        undefinedHandles: preflight.undefinedHandles || [],
+        warningCount: preflight.warnings?.length || 0
+      }
+    },
+    nativeCharacterMentions: {
+      requestedNames: requiredHandles,
+      matchedNames: [],
+      unresolvedNames: []
+    }
+  };
 }
 
 function promptMapKey(_prompt, index) {
@@ -3983,6 +4276,7 @@ async function buildJobs() {
 
   const prompts = jobPromptLinesForRun();
   if (!prompts.length) throw new Error("Add at least one prompt.");
+  const characterPreflight = assertCharacterPreflightOk(characterPreflightForPrompts(prompts));
   applyAutoMatchPromptRefMapForRun(prompts, state);
   const projectId = await ensureFlowProject();
   if (!projectId) throw new Error(state.runtime.error || translate("flowTabNotFoundGuidance", {}, currentLocale()));
@@ -4025,6 +4319,7 @@ async function buildJobs() {
         ? promptPayload.prompt
         : injectAutoMatchReferenceFilenames(promptPayload.prompt, autoMatchDetails);
       const autoMatchReferenceMentions = compactAutoMatchReferenceMentions(autoMatchDetails);
+      const characterFields = characterMetadataForJob(characterPreflight, index);
       const job = {
         prompt: promptPayload.prompt,
         sourcePrompt: promptPayload.sourcePrompt,
@@ -4049,7 +4344,8 @@ async function buildJobs() {
         endRefInput: endRef,
         startMediaId: startRef?.mediaId || mediaIds[0] || "",
         endMediaId: endRef?.mediaId || "",
-        autoMatchReferenceMentions
+        autoMatchReferenceMentions,
+        ...characterFields
       };
 
       jobs.push({
@@ -4095,6 +4391,7 @@ async function buildJobs() {
       ? promptPayload.prompt
       : injectAutoMatchReferenceFilenames(promptPayload.prompt, autoMatchDetails);
     const autoMatchReferenceMentions = compactAutoMatchReferenceMentions(autoMatchDetails);
+    const characterFields = characterMetadataForJob(characterPreflight, index);
     const job = {
       prompt: promptPayload.prompt,
       sourcePrompt: promptPayload.sourcePrompt,
@@ -4111,7 +4408,8 @@ async function buildJobs() {
       referenceChainMode: (continuityChain || continuityChainPlus) && index > 0 ? "previous_output" : "",
       referenceChainSeed: (continuityChain || continuityChainPlus) && index === 0,
       referenceChainIndex: (continuityChain || continuityChainPlus) ? index : null,
-      autoMatchReferenceMentions
+      autoMatchReferenceMentions,
+      ...characterFields
     };
     jobs.push({
       ...(await enrichTaskWithCharacterRefs(job)),
@@ -4344,6 +4642,7 @@ async function enqueueAndRun() {
     state.control.lastRunError = "";
     const prompts = promptLines();
     if (!prompts.length) throw new Error("Add at least one prompt.");
+    assertCharacterPreflightOk(characterPreflightForPrompts(prompts));
     if (state.control.activeApplyMode === "repeat" && oneToOneBatchRefIds().length < 1) {
       throw new Error("Repeat 1st Prompt needs uploaded reference images.");
     }
@@ -4437,11 +4736,11 @@ async function enqueueAndRun() {
     if (!appendToActiveRun) {
       state.queue.running = false;
     }
-    const needsControlFix = /reference|start frame|ingredients|prompt/i.test(errorMessage);
+    const needsControlFix = /reference|start frame|ingredients|prompt|character|voice|@/i.test(errorMessage);
     state.ui.activeRoute = needsControlFix ? "control" : appendToActiveRun ? "live" : "control";
     if (/reference|start frame|ingredients/i.test(errorMessage)) {
       state.control.wizardStep = 2;
-    } else if (/prompt/i.test(errorMessage)) {
+    } else if (/prompt|character|voice|@/i.test(errorMessage)) {
       state.control.wizardStep = 1;
     }
     appendLog("error", "queue", error.message);

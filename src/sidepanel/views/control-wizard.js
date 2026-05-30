@@ -15,6 +15,7 @@
 import { FLOW_MODES } from "../runtime-config.js";
 import { translate } from "../i18n.js";
 import { splitAutoFlowPromptLine, matchedReferenceIdsForPrompt } from "../../core/gallery/animate-prompts.js";
+import { validateCharacterRun } from "../../core/characters/character-prompts.js";
 
 // ── DOM helpers ────────────────────────────────────────────
 function el(tag, opts, ...kids) {
@@ -189,6 +190,36 @@ function promptsHaveAutopilotVideoPrompts(prompts = []) {
   });
 }
 
+function characterPromptText(state) {
+  return String(state.control?.characterPromptText || "");
+}
+
+function characterPromptsAvailableForMode(state) {
+  return state.control?.mode === FLOW_MODES.textToImage;
+}
+
+function characterRunAnalysis(state, prompts = parsePrompts(state.control?.livePrompt)) {
+  if (!characterPromptsAvailableForMode(state)) {
+    return { ok: true, intents: [], errors: [], warnings: [], scenes: [], usedHandles: [], undefinedHandles: [] };
+  }
+  return validateCharacterRun(prompts, characterPromptText(state), {
+    voiceCatalog: state.characters?.voiceCatalog || {},
+    storeInFlow: state.characters?.storeInFlow === true
+  });
+}
+
+function compactSelect(settingKey, value, options) {
+  return el("select", {
+    class: "afw-val-btn",
+    data: { settingKey }
+  },
+    options.map(([optionValue, label]) => el("option", {
+      text: label,
+      attrs: { value: optionValue, selected: String(value) === String(optionValue) }
+    }))
+  );
+}
+
 // ── Public render ────────────────────────────────────────────
 // Module-level cursor that tracks the LAST RENDERED wizardStep so we can detect
 // whether a re-render is a step transition (and which direction) vs an in-step
@@ -207,6 +238,7 @@ export function renderControlWizard(root, state, ctx = {}) {
   const wizardRoot = el("div", { class: "afw-root" });
   wizardRoot.append(
     el("input", { id: "fileInput", attrs: { type: "file", accept: ".txt,text/plain", hidden: true } }),
+    el("input", { id: "characterPromptFileInput", attrs: { type: "file", accept: ".txt,text/plain", hidden: true } }),
     el("input", { id: "refImageInput", attrs: { type: "file", accept: ".png,.jpg,.jpeg,.webp,.heic,.avif", multiple: true, hidden: true } }),
     el("input", { id: "imageInput", attrs: { type: "file", accept: ".png,.jpg,.jpeg,.webp,.heic,.avif", multiple: true, hidden: true } }),
   );
@@ -283,7 +315,7 @@ export function renderControlWizard(root, state, ctx = {}) {
     stepView.append(
       buildStepHeaderRun(M, prompts, dispatch, state, onRun),
       ...(errorBanner ? [errorBanner] : []),
-      buildStep3Body(state, prompts, refs, M),
+      buildStep3Body(state, prompts, refs, M, dispatch),
     );
   }
   wizardRoot.appendChild(stepView);
@@ -393,7 +425,11 @@ function canRunFromAccount(state) {
 
 
 function runBlockerLabel(state, promptCount = 0) {
-  if (!promptCount) return tr(state, "addPromptsToRun");
+  if (!promptCount) {
+    return String(state.control?.characterPromptText || "").trim()
+      ? tr(state, "addWorkflowPromptsToRun")
+      : tr(state, "addPromptsToRun");
+  }
   // Modes that require a reference image must have at least one attached
   // before Run is allowed. Without this guard the run handoff in app.js
   // mutates state.ui.activeRoute = "live" + renders preparing UI BEFORE
@@ -556,6 +592,33 @@ function buildStepHeaderRun(mode, prompts, dispatch, state, onRun) {
 
 // ── Step 1: Prompts ──────────────────────────────────────────
 function buildStep1Body(state, text, prompts, dispatch) {
+  const characterAvailable = characterPromptsAvailableForMode(state);
+  const activeTab = characterAvailable && state.control?.promptTab === "character_prompts"
+    ? "character_prompts"
+    : "workflow_prompts";
+  const tabs = characterAvailable ? el("div", { class: "afw-tabs", attrs: { role: "tablist" } },
+    el("button", {
+      class: `afw-tab${activeTab === "workflow_prompts" ? " active" : ""}`,
+      attrs: { type: "button", role: "tab", "aria-selected": activeTab === "workflow_prompts" ? "true" : "false" },
+      on: { click: (e) => { stopControlEvent(e); dispatch({ control: { promptTab: "workflow_prompts" } }); } }
+    }, tr(state, "prompts")),
+    el("button", {
+      class: `afw-tab${activeTab === "character_prompts" ? " active" : ""}`,
+      attrs: { type: "button", role: "tab", "aria-selected": activeTab === "character_prompts" ? "true" : "false" },
+      on: { click: (e) => { stopControlEvent(e); dispatch({ control: { promptTab: "character_prompts" } }); } }
+    }, tr(state, "characterPrompts"))
+  ) : null;
+
+  if (activeTab === "character_prompts") {
+    return buildCharacterPromptStepBody(
+      state,
+      characterPromptText(state),
+      characterRunAnalysis(state, prompts),
+      dispatch,
+      tabs
+    );
+  }
+
   let previewWrap;
   let countNode;
   const renderPreview = (nextText) => {
@@ -566,6 +629,7 @@ function buildStep1Body(state, text, prompts, dispatch) {
     appendPromptPreview(state, previewWrap, nextPrompts);
   };
   const ta = el("textarea", {
+    id: "prompts",
     placeholder: tr(state, "promptPastePlaceholder"),
     on: {
       input: (e) => {
@@ -586,6 +650,7 @@ function buildStep1Body(state, text, prompts, dispatch) {
   appendPromptPreview(state, previewWrap, prompts);
 
   return el("div", { class: "afw-step-body" },
+    tabs,
     el("p", { class: "afw-lede", text: tr(state, "pasteBatchHelp") }),
     el("div", { class: "afw-paste" },
       ta,
@@ -596,6 +661,52 @@ function buildStep1Body(state, text, prompts, dispatch) {
       ),
     ),
     previewWrap,
+  );
+}
+
+function buildCharacterPromptStepBody(state, text, analysis, dispatch, tabs) {
+  let listWrap;
+  let countNode;
+  let issueNode;
+  const renderParsed = (nextText) => {
+    const next = validateCharacterRun(parsePrompts(state.control?.livePrompt), nextText, {
+      voiceCatalog: state.characters?.voiceCatalog || {},
+      storeInFlow: state.characters?.storeInFlow === true
+    });
+    if (countNode) countNode.textContent = String(next.intents.length);
+    if (issueNode) issueNode.textContent = next.errors.length ? tr(state, "characterErrorsFound", { count: next.errors.length }) : "";
+    if (!listWrap) return;
+    clear(listWrap);
+    appendCharacterPreview(state, listWrap, next);
+  };
+  const ta = el("textarea", {
+    id: "characterPrompts",
+    placeholder: tr(state, "characterPromptPlaceholder"),
+    on: {
+      input: (e) => {
+        renderParsed(e.target.value);
+        dispatch({ control: { characterPromptText: e.target.value } });
+      },
+    },
+  });
+  ta.value = text;
+  countNode = el("b", { text: String(analysis.intents.length) });
+  issueNode = el("span", { class: "afw-character-issues", text: analysis.errors.length ? tr(state, "characterErrorsFound", { count: analysis.errors.length }) : "" });
+  listWrap = el("div", { class: "afw-character-list" });
+  appendCharacterPreview(state, listWrap, analysis);
+  return el("div", { class: "afw-step-body" },
+    tabs,
+    el("p", { class: "afw-lede", text: tr(state, "characterPromptHelp") }),
+    el("div", { class: "afw-paste" },
+      ta,
+      el("div", { class: "afw-paste-row" },
+        el("button", { id: "uploadCharacterPromptButton", class: "afw-back", attrs: { type: "button", style: "padding:5px 10px;font-size:10.5px;" } }, icon("file_upload"), tr(state, "import")),
+        el("button", { id: "pasteCharacterPromptButton", class: "afw-back", attrs: { type: "button", style: "padding:5px 10px;font-size:10.5px;" } }, icon("content_paste"), tr(state, "paste")),
+        el("span", { class: "afw-paste-ct" }, countNode, ` ${tr(state, "charactersDetected")}`),
+      ),
+    ),
+    issueNode,
+    listWrap,
   );
 }
 
@@ -613,6 +724,34 @@ function appendPromptPreview(state, previewWrap, prompts) {
       el("div", { class: "afw-body", text: p }),
     ));
   });
+}
+
+function appendCharacterPreview(state, listWrap, analysis) {
+  if (!analysis.intents.length && !analysis.errors.length) {
+    listWrap.appendChild(el("div", { class: "afw-character-empty", text: tr(state, "characterParseEmpty") }));
+    return;
+  }
+  for (const error of analysis.errors || []) {
+    listWrap.appendChild(el("div", { class: "afw-character-row is-error" },
+      el("span", { class: "afw-character-handle", text: error.handle ? `@${error.handle}` : "!" }),
+      el("span", { class: "afw-character-meta", text: error.message || error.code || tr(state, "error") }),
+    ));
+  }
+  for (const intent of analysis.intents || []) {
+    const voiceLabel = intent.voice?.mode === "selected_flow_voice"
+      ? intent.voice.flowVoiceName
+      : intent.voice?.mode === "unresolved"
+        ? tr(state, "characterVoiceBlocker")
+        : tr(state, "characterVoiceNone");
+    const usedCount = (analysis.scenes || []).filter((scene) => scene.requiredCharacters?.includes(intent.handle)).length;
+    listWrap.appendChild(el("div", { class: `afw-character-row${intent.voice?.mode === "unresolved" ? " is-error" : ""}` },
+      el("span", { class: "afw-character-handle", text: `@${intent.handle}` }),
+      el("span", { class: "afw-character-meta", text: intent.description }),
+      el("span", { class: "afw-character-pill", text: voiceLabel }),
+      intent.additionalInfo ? el("span", { class: "afw-character-pill", text: tr(state, "characterInfoAdded") }) : null,
+      usedCount ? el("span", { class: "afw-character-pill", text: `${usedCount} prompt${usedCount === 1 ? "" : "s"}` }) : null,
+    ));
+  }
 }
 
 // ── Step 2: References ──────────────────────────────────────
@@ -639,9 +778,20 @@ function buildStep2Body(state, dispatch) {
         : mode === FLOW_MODES.ingredientsToVideo
           ? tr(state, "ingredientsRefsHelp")
           : tr(state, "createImageRefsHelp");
+  const characterTabsAvailable = mode === FLOW_MODES.textToImage;
+  const activeTab = characterTabsAvailable && state.control?.referencesTab === "character_sources" ? "character_sources" : "prompt_references";
+  const tabs = characterTabsAvailable ? buildSegmentTabs(state, [
+    ["prompt_references", tr(state, "promptReferences")],
+    ["character_sources", tr(state, "characterSources")]
+  ], activeTab, (value) => dispatch({ control: { referencesTab: value } })) : null;
+
+  if (activeTab === "character_sources") {
+    return buildCharacterSourcesStepBody(state, dispatch, tabs);
+  }
 
   if (mode === FLOW_MODES.textToVideo) {
     return el("div", { class: "afw-step-body" },
+      tabs,
       el("div", { class: "afw-no-refs-card" },
         el("div", { class: "afw-icn" }, icon("text_fields")),
         el("div", { class: "afw-meta" },
@@ -724,6 +874,7 @@ function buildStep2Body(state, dispatch) {
   const ctaGrid = el("div", { class: "afw-cta-grid" }, ...ctaItems);
 
   return el("div", { class: "afw-step-body" },
+    tabs,
     el("p", { class: "afw-lede", text: refCopy }),
     el("div", { class: "afw-eyebrow" }, icon("auto_fix_high"), tr(state, "applyReferences")),
     ctaGrid,
@@ -751,6 +902,121 @@ function buildStep2Body(state, dispatch) {
       activeRefIds.length ? el("button", { id: "clearSelectedRef", class: "afw-back", attrs: { type: "button" } }, icon("backspace"), tr(state, "clearActiveReferences")) : null,
       el("button", { id: "clearRefImagesBtn", class: "afw-back", attrs: { type: "button", disabled: refs.length ? null : "disabled" } }, icon("delete"), tr(state, "clearReferenceLibrary"))
     ),
+  );
+}
+
+function buildSegmentTabs(state, items, activeKey, onSelect) {
+  return el("div", { class: "afw-tabs afw-tabs-compact", attrs: { role: "tablist" } },
+    items.map(([key, label]) => el("button", {
+      class: `afw-tab${activeKey === key ? " active" : ""}`,
+      attrs: { type: "button", role: "tab", "aria-selected": activeKey === key ? "true" : "false" },
+      on: { click: (event) => { stopControlEvent(event); onSelect?.(key); } }
+    }, label))
+  );
+}
+
+function buildCharacterSourcesStepBody(state, dispatch, tabs) {
+  const analysis = characterRunAnalysis(state);
+  const refs = allReferenceItems(state);
+  const savedCount = Array.isArray(state.characters?.savedMappings) ? state.characters.savedMappings.length : 0;
+  const activeCount = analysis.intents.length;
+  const estimatedBytes = analysis.intents.reduce((sum, intent) => sum + Number(intent.storage?.estimatedBytes || 0), 0);
+  const voiceOptions = [["", tr(state, "characterVoiceNone")], ...(state.characters?.voiceCatalog?.voices || []).map((voice) => [voice.displayName, voice.displayName])];
+  const rows = el("div", { class: "afw-character-list" });
+
+  if (!analysis.intents.length) {
+    rows.appendChild(el("div", { class: "afw-character-empty", text: tr(state, "characterParseEmpty") }));
+  } else {
+    for (const intent of analysis.intents) {
+      const source = state.control?.characterSources?.[intent.handle] || {};
+      const sourceMode = source.sourceMode || intent.source?.mode || "generate_from_description";
+      const selectedRefId = String(source.sourceRefId || "");
+      const sourcePicker = refs.length
+        ? el("div", { class: "afw-character-source-picker" },
+            refs.map((ref) => {
+              const id = String(ref.id || "");
+              const active = id && id === selectedRefId;
+              return el("button", {
+                class: `afw-character-source-thumb${active ? " active" : ""}`,
+                data: { characterSourceRefHandle: intent.handle, characterSourceRefId: id },
+                attrs: { type: "button", title: ref.title || ref.fileName || ref.name || id }
+              },
+                imageForRef(ref, "afw-character-source-img"),
+                el("span", { text: ref.title || ref.fileName || ref.name || id })
+              );
+            })
+          )
+        : el("div", { class: "afw-character-source-empty", text: tr(state, "characterSourceNoImages") });
+      const statusLabel = selectedRefId || source.flowCharacterId
+        ? tr(state, "characterStatusReady")
+        : sourceMode === "generate_from_description"
+          ? tr(state, "characterSourceFromDescription")
+          : tr(state, "characterStatusNeedsCreation");
+      rows.appendChild(el("div", { class: `afw-character-source-row${intent.voice?.mode === "unresolved" ? " is-error" : ""}` },
+        el("div", { class: "afw-character-source-main" },
+          el("strong", { text: `@${intent.handle}` }),
+          el("span", { text: intent.displayName }),
+          el("small", { text: intent.voice?.mode === "selected_flow_voice" ? intent.voice.flowVoiceName : intent.voice?.mode === "unresolved" ? tr(state, "characterVoiceBlocker") : tr(state, "characterVoiceNone") }),
+        ),
+        el("div", { class: "afw-character-source-controls" },
+          compactSelect(`characterSource:${intent.handle}:sourceMode`, sourceMode, [
+            ["generate_from_description", tr(state, "characterSourceGenerate")],
+            ["reference_library", tr(state, "characterSourceReference")],
+            ["existing_flow_character", tr(state, "characterSourceExisting")],
+            ["saved_flow_character", tr(state, "characterSourceSaved")]
+          ]),
+          compactSelect(`characterSource:${intent.handle}:requestedVoice`, source.requestedVoice || intent.voice?.flowVoiceName || "", voiceOptions),
+          el("span", { class: "afw-character-pill", text: statusLabel }),
+          selectedRefId ? el("button", {
+            class: "afw-character-source-clear",
+            data: { characterSourceClear: intent.handle },
+            attrs: { type: "button", title: tr(state, "clear") || "Clear" }
+          }, icon("close")) : null
+        ),
+        el("div", { class: "afw-character-source-label" }, icon("image"), tr(state, "characterSourcePickImage")),
+        sourcePicker
+      ));
+    }
+  }
+
+  const sourceUpload = el("div", { class: "afw-character-source-upload" },
+    el("div", { class: "afw-reflib-main" },
+      el("div", { class: "afw-icn" }, icon("add_photo_alternate")),
+      el("div", { class: "afw-meta" },
+        el("span", { class: "afw-name", text: tr(state, "characterSourceUploadCta") }),
+        el("span", { class: "afw-sub", text: tr(state, "characterSourceUploadHelp") }),
+      ),
+    ),
+    el("button", { id: "characterSourceUploadButton", class: "afw-add-btn", attrs: { type: "button" } },
+      icon("upload"),
+      el("span", { text: tr(state, "uploadReferences") })
+    )
+  );
+  const storage = el("div", { class: "afw-character-storage" },
+    el("div", { class: "afw-reflib-main" },
+      el("div", { class: "afw-icn" }, icon("badge")),
+      el("div", { class: "afw-meta" },
+        el("span", { class: "afw-name", text: tr(state, "flowCharacterStorage") }),
+        el("span", { class: "afw-sub", text: tr(state, "characterStorageStats", { saved: savedCount, size: formatBytes(estimatedBytes), active: activeCount }) }),
+      ),
+    ),
+    el("label", { class: "afw-save-library-toggle" },
+      el("input", {
+        id: "storeCharactersInFlowToggle",
+        checked: state.characters?.storeInFlow === true,
+        attrs: { type: "checkbox" },
+        on: { change: (event) => dispatch({ characters: { storeInFlow: event.target.checked } }) }
+      }),
+      el("span", { text: tr(state, "storeCharactersInFlow") })
+    )
+  );
+
+  return el("div", { class: "afw-step-body" },
+    tabs,
+    el("p", { class: "afw-lede", text: tr(state, "characterSourceHelp") }),
+    sourceUpload,
+    storage,
+    rows,
   );
 }
 
@@ -949,8 +1215,15 @@ function formatBytes(n) {
 }
 
 // ── Step 3: Review & Run ──────────────────────────────────
-function buildStep3Body(state, prompts, refs, mode) {
+function buildStep3Body(state, prompts, refs, mode, dispatch = () => {}) {
   const promptRefMap = state.control?.promptRefMap || {};
+  void promptRefMap;
+  const characterMappingAvailable = mode.key === FLOW_MODES.textToImage;
+  const activeMappingTab = characterMappingAvailable && state.control?.runMappingTab === "character_mapping" ? "character_mapping" : "prompt_mapping";
+  const mappingTabs = characterMappingAvailable ? buildSegmentTabs(state, [
+    ["prompt_mapping", tr(state, "promptMapping")],
+    ["character_mapping", tr(state, "characterMapping")]
+  ], activeMappingTab, (value) => dispatch({ control: { runMappingTab: value } })) : null;
 
   const pairList = el("div", { class: "afw-pair-list" });
   if (prompts.length === 0) {
@@ -991,6 +1264,7 @@ function buildStep3Body(state, prompts, refs, mode) {
       ));
     });
   }
+  const characterMappingList = characterMappingAvailable ? buildCharacterMappingList(state, prompts) : null;
 
   const presets = state.control?.presets || {};
   const modelKey = mode.defaultModelKey;
@@ -1122,16 +1396,73 @@ function buildStep3Body(state, prompts, refs, mode) {
 
   return el("div", { class: "afw-step-body" },
     el("p", { class: "afw-lede", text: tr(state, "reviewRunHelp") }),
-    el("div", { class: "afw-eyebrow" }, icon("checklist"), tr(state, "promptsToReferences"),
+    mappingTabs,
+    el("div", { class: "afw-eyebrow" }, icon("checklist"), activeMappingTab === "character_mapping" ? tr(state, "characterMapping") : tr(state, "promptsToReferences"),
       el("span", { class: "afw-right" }, el("b", { text: String(prompts.length) }), ` ${tr(state, "total")}`),
     ),
-    pairList,
+    activeMappingTab === "character_mapping" ? characterMappingList : pairList,
     el("div", { class: "afw-eyebrow", attrs: { style: "margin-top:6px;" } }, icon("settings"), tr(state, "generation"),
       el("span", { class: "afw-right", text: tr(state, "settingsOverrideHere") }),
     ),
     settingsCard,
     estimate,
   );
+}
+
+function buildCharacterMappingList(state, prompts = []) {
+  const analysis = characterRunAnalysis(state, prompts);
+  const allRefs = allReferenceItems(state);
+  const list = el("div", { class: "afw-pair-list afw-character-map-list" });
+  if (!analysis.intents.length) {
+    list.appendChild(el("div", { class: "afw-pair-row" },
+      el("div", { class: "afw-idx", text: "@" }),
+      el("div", { class: "afw-text", text: tr(state, "characterParseEmpty") }),
+      el("div", { class: "afw-refs" }),
+    ));
+    return list;
+  }
+
+  for (const intent of analysis.intents) {
+    const usedScenes = (analysis.scenes || [])
+      .filter((scene) => scene.requiredCharacters?.includes(intent.handle))
+      .map((scene) => pad2(Number(scene.promptIndex || 0) + 1));
+    const voice = intent.voice?.mode === "selected_flow_voice"
+      ? intent.voice.flowVoiceName
+      : intent.voice?.mode === "unresolved"
+        ? tr(state, "characterVoiceBlocker")
+        : tr(state, "characterVoiceNone");
+    const source = state.control?.characterSources?.[intent.handle] || {};
+    const sourceRef = allRefs.find((ref) => String(ref.id || "") === String(source.sourceRefId || "")) || null;
+    const sourceMode = source.sourceMode || (sourceRef ? "reference_library" : "generate_from_description");
+    const ready = Boolean(source.flowCharacterId || source.sourceRefId || source.sourceMediaId);
+    const status = ready
+      ? tr(state, "characterStatusReady")
+      : intent.voice?.mode === "unresolved"
+        ? tr(state, "characterStatusFailed")
+        : tr(state, "characterStatusNeedsCreation");
+    const refsEl = el("div", { class: "afw-refs" },
+      sourceRef ? el("div", {
+        class: "afw-ref-mini",
+        attrs: { title: sourceRef.title || sourceRef.fileName || sourceRef.name || sourceRef.id }
+      }, imageForRef(sourceRef, "afw-ref-mini-img")) : null,
+      usedScenes.length ? el("span", { class: "afw-character-pill", text: usedScenes.join(", ") }) : el("span", { class: "afw-no-ref", text: "unused" }),
+      el("span", { class: "afw-character-pill", text: status }),
+    );
+    list.appendChild(el("div", { class: `afw-pair-row afw-character-map-row${intent.voice?.mode === "unresolved" ? " is-error" : ""}` },
+      el("div", { class: "afw-idx", text: `@${intent.handle}` }),
+      el("div", { class: "afw-text", text: `${intent.displayName} · ${voice} · ${sourceMode}` }),
+      refsEl,
+    ));
+  }
+
+  for (const error of analysis.errors || []) {
+    list.appendChild(el("div", { class: "afw-pair-row afw-character-map-row is-error" },
+      el("div", { class: "afw-idx", text: error.handle ? `@${error.handle}` : "!" }),
+      el("div", { class: "afw-text", text: error.message || error.code }),
+      el("div", { class: "afw-refs" }, el("span", { class: "afw-no-ref", text: tr(state, "error") })),
+    ));
+  }
+  return list;
 }
 
 function promptMapKey(_prompt, index) {

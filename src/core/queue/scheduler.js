@@ -10,7 +10,7 @@ export function isActiveTaskStatus(status) {
   return ACTIVE_TASK_STATUSES.includes(status);
 }
 
-function queueErrorText(error) {
+export function queueErrorText(error) {
   if (error === null || error === undefined) return "";
   if (typeof error === "string") return error;
   if (typeof error === "number") return String(error);
@@ -38,8 +38,56 @@ function queueErrorText(error) {
   }
 }
 
+export function isFlowRendererCrashText(raw = "") {
+  const text = queueErrorText(raw).toLowerCase();
+  if ((text.includes("number of requests sent exceeds the quota limit") || text.includes("quota limit")) && /error code:?\s*253/.test(text)) {
+    return false;
+  }
+  return text.includes("flow_renderer_crashed") ||
+    /aw,\s*snap!?/.test(text) ||
+    text.includes("something went wrong while displaying this webpage") ||
+    /error code:\s*[a-z0-9_-]+/.test(text);
+}
+
+export function flowRendererCrashErrorCode(raw = "") {
+  return String(queueErrorText(raw) || "").match(/error code:\s*([a-z0-9_-]+)/i)?.[1] || "";
+}
+
+export function isFlowProjectLikeUrl(url = "") {
+  try {
+    const parsed = new URL(String(url || ""));
+    return /(^|\.)labs\.google(?:\.com)?$/i.test(parsed.hostname)
+      && /^\/fx\/(?:[^/?#]+\/)?tools\/flow\/project\/[0-9a-f-]{36}(?:\/|$)/i.test(parsed.pathname);
+  } catch {
+    return /https:\/\/labs\.google(?:\.com)?\/fx\/(?:[^/?#]+\/)?tools\/flow\/project\/[0-9a-f-]{36}(?:\/|$|\?)/i.test(String(url || ""));
+  }
+}
+
+export function detectFlowRendererCrashSnapshot(snapshot = {}) {
+  const url = String(snapshot.url || snapshot.href || "");
+  const title = String(snapshot.title || "");
+  const bodyText = String(snapshot.text || snapshot.bodyText || snapshot.body || "");
+  const error = String(snapshot.error || snapshot.cdpError || "");
+  const combined = [title, bodyText, error].filter(Boolean).join(" ");
+  const flowProjectUrl = isFlowProjectLikeUrl(url);
+  const crashed = flowProjectUrl && isFlowRendererCrashText(combined);
+  return {
+    crashed,
+    flowProjectUrl,
+    class: crashed ? "flow_renderer_crashed" : "",
+    retryable: crashed,
+    healAction: crashed ? "recover_flow_page" : "",
+    scope: crashed ? "global" : "",
+    errorCode: crashed ? flowRendererCrashErrorCode(combined) : "",
+    textPreview: combined.replace(/\s+/g, " ").trim().slice(0, 240)
+  };
+}
+
 export function classifyQueueError(error) {
   const raw = queueErrorText(error).toLowerCase();
+  if (isFlowRendererCrashText(raw)) {
+    return { class: "flow_renderer_crashed", retryable: true, healAction: "recover_flow_page", scope: "global" };
+  }
   if (
     raw.includes("store_direct_frame_attach_failed") ||
     raw.includes("dom_frame_ref_attach_not_persisted") ||
@@ -54,8 +102,16 @@ export function classifyQueueError(error) {
   }
   if (
     raw.includes("flow_page_loading") ||
+    raw.includes("dom_frontend_not_ready") ||
+    raw.includes("composer_ready_state_failed") ||
     (raw.includes("composer_not_ready") && raw.includes("flow_loading")) ||
     raw.includes("message channel closed before a response was received")
+  ) {
+    return { class: "flow_connection", retryable: true, healAction: "reconnect_flow", scope: "global" };
+  }
+  if (
+    raw.includes("composer_not_ready") &&
+    /editor_missing|editor_unstable|create_missing|create_unstable|settings_trigger_missing|settings_trigger_unstable/.test(raw)
   ) {
     return { class: "flow_connection", retryable: true, healAction: "reconnect_flow", scope: "global" };
   }
@@ -64,6 +120,9 @@ export function classifyQueueError(error) {
   }
   if (raw.includes("dom_debugger_") || raw.includes("chrome_debugger")) {
     return { class: "dom_debugger", retryable: false, healAction: "debugger_path_needs_attention", scope: "task" };
+  }
+  if (raw.includes("error code 253") || raw.includes("number of requests sent exceeds the quota limit")) {
+    return { class: "rate_limit", retryable: true, healAction: "backoff", scope: "global" };
   }
   if (raw.includes("not_signed_in") || raw.includes("license_required") || raw.includes("subscription") || raw.includes("quota") || raw.includes("credits")) {
     return { class: "account_block", retryable: false, healAction: "account_action_required", scope: "global" };

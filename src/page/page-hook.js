@@ -2475,10 +2475,40 @@
     return out;
   }
 
+  function collectSlatePromptText(node, out = []) {
+    if (!node || typeof node !== "object") return out;
+    if (node.type === "AT_TAG_TYPE" && node.displayText) {
+      out.push(`@ ${String(node.displayText || "").trim()}`.trim());
+      return out;
+    }
+    if (typeof node.text === "string") out.push(node.text);
+    if (Array.isArray(node.children)) {
+      node.children.forEach((child) => collectSlatePromptText(child, out));
+    }
+    return out;
+  }
+
+  function slatePromptText(children = []) {
+    if (!Array.isArray(children)) return collectSlatePromptText(children, []).join("");
+    return children
+      .map((node) => collectSlatePromptText(node, []).join(""))
+      .join("\n");
+  }
+
+  function normalizeMentionPromptForCompare(value = "") {
+    return compactPromptForCompare(String(value || "").replace(/@[\s\u00a0]+/g, "@")).toLowerCase();
+  }
+
   function promptStoreText(store = resolvePromptStore()) {
     const textEditor = store?.getState?.()?.inputs?.textEditor;
     if (!textEditor) return "";
     return collectSlateText(textEditor, []).join("");
+  }
+
+  function promptStoreSemanticText(store = resolvePromptStore()) {
+    const textEditor = store?.getState?.()?.inputs?.textEditor;
+    if (!textEditor) return "";
+    return slatePromptText(Array.isArray(textEditor) ? textEditor : [textEditor]);
   }
 
   async function setPromptStoreText(value) {
@@ -2526,6 +2556,376 @@
       }
     }
     return null;
+  }
+
+  function normalizeNativeCharacterName(name = "") {
+    return String(name || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[_-]+/g, " ")
+      .replace(/[\s\u00a0]+/g, " ");
+  }
+
+  function extractNativeCharacterMentionNames(value = "") {
+    const names = [];
+    const seen = new Set();
+    const pattern = /(^|[\s([{,:;])@[\s\u00a0]*([A-Za-z0-9][A-Za-z0-9_-]{1,63})/g;
+    let match;
+    while ((match = pattern.exec(String(value || "")))) {
+      const raw = String(match[2] || "").trim();
+      const key = normalizeNativeCharacterName(raw);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      names.push(raw);
+      if (names.length >= 12) break;
+    }
+    return names;
+  }
+
+  function exactNativeCharacterTextMatch(element, name = "") {
+    const expected = normalizeNativeCharacterName(name);
+    if (!expected || !element) return false;
+    const texts = [
+      visibleText(element),
+      ...Array.from(element.querySelectorAll?.("img[alt], span, div") || [])
+        .map((node) => visibleText(node) || node.getAttribute?.("alt") || "")
+    ];
+    return texts.some((text) => normalizeNativeCharacterName(text) === expected);
+  }
+
+  function resolveNativeCharacterDomCandidate(name = "") {
+    const expected = normalizeNativeCharacterName(name);
+    if (!expected) return null;
+    const candidates = Array.from(document.querySelectorAll("a[href*='/character/']"))
+      .map((anchor) => {
+        const href = String(anchor.getAttribute("href") || anchor.href || "");
+        const id = href.match(/\/character\/([0-9a-f]{8}-[0-9a-f-]{27,})/i)?.[1] || "";
+        if (!id) return null;
+        const card = anchor.closest("[data-tile-id], [role='button'], [data-index], [data-item-index]") || anchor;
+        const altMatches = Array.from(card.querySelectorAll?.("img[alt]") || [])
+          .map((img) => String(img.getAttribute("alt") || "").trim())
+          .filter(Boolean);
+        const imageBacked = altMatches.some((alt) => normalizeNativeCharacterName(alt) === expected);
+        const textBacked = exactNativeCharacterTextMatch(card, name) || exactNativeCharacterTextMatch(anchor, name);
+        if (!imageBacked && !textBacked) return null;
+        const rect = card.getBoundingClientRect();
+        return {
+          characterServerId: id,
+          displayText: name,
+          source: "dom_character_card",
+          imageBacked,
+          textBacked,
+          href,
+          rect: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          },
+          score: (imageBacked ? 1000 : 0) + (textBacked ? 100 : 0) + Math.max(0, 1000 - Math.round(rect.y))
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+    return candidates[0] || null;
+  }
+
+  async function fetchNativeCharacterRowsByName(names = []) {
+    const wanted = new Set(names.map((name) => normalizeNativeCharacterName(name)).filter(Boolean));
+    if (!wanted.size) return {};
+    try {
+      const projectId = projectIdFromUrl();
+      if (!projectId) return {};
+      const input = encodeURIComponent(JSON.stringify({ json: { projectId } }));
+      const fetchImpl = window.__afRebuildNativeFetch || originalFetch || window.fetch;
+      let response;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const abort = withAbortTimeout(12000);
+        try {
+          response = await fetchImpl.call(window, `/fx/api/trpc/flow.projectInitialData?input=${input}`, {
+            credentials: "include",
+            signal: abort.signal
+          });
+          if (response?.ok) break;
+        } catch (error) {
+          if (attempt >= 1) throw error;
+        } finally {
+          abort.cancel();
+        }
+        await sleep(500);
+      }
+      if (!response.ok) return {};
+      const json = await response.json();
+      const rows = [];
+      const walk = (value) => {
+        if (!value || typeof value !== "object") return;
+        const info = value.entityInfo && typeof value.entityInfo === "object" ? value.entityInfo : {};
+        const displayName = String(info.displayName || value.displayName || value.name || value.title || "").trim();
+        const entityType = String(info.entityType || value.entityType || value.type || "").toUpperCase();
+        const id = String(value.serverId || value.entityId || value.id || "").trim();
+        if (displayName && id && entityType === "CHARACTER" && wanted.has(normalizeNativeCharacterName(displayName))) {
+          const imageReferences = Array.isArray(info.characterInfo?.imageReferences)
+            ? info.characterInfo.imageReferences
+            : [];
+          const hasImageReference = imageReferences.some((ref) => ref && typeof ref === "object" && Object.keys(ref).length);
+          const hasThumbnail = Boolean(value.thumbnailMediaId);
+          const updateMs = Date.parse(value.updateTime || value.createTime || "") || 0;
+          rows.push({
+            displayText: displayName,
+            characterServerId: id,
+            source: "project_initial_data",
+            thumbnailMediaId: String(value.thumbnailMediaId || ""),
+            hasImageReference,
+            updateMs,
+            score: (hasThumbnail ? 1000000 : 0) + (hasImageReference ? 100000 : 0) + Math.min(updateMs, 9999999999999)
+          });
+        }
+        Object.values(value).forEach(walk);
+      };
+      walk(json);
+      return rows
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .reduce((acc, row) => {
+          const key = normalizeNativeCharacterName(row.displayText);
+          if (!acc[key]) acc[key] = [row];
+          return acc;
+        }, {});
+    } catch {
+      return {};
+    }
+  }
+
+  async function resolveNativeCharacterMentionNodes(names = []) {
+    const resolved = {};
+    const diagnostics = {};
+    for (const name of names) {
+      const key = normalizeNativeCharacterName(name);
+      const domCandidate = resolveNativeCharacterDomCandidate(name);
+      diagnostics[key] = { name, domCandidate: domCandidate || null };
+      if (domCandidate?.characterServerId) {
+        resolved[key] = {
+          id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+          type: "AT_TAG_TYPE",
+          children: [{ text: "@" }],
+          characterServerId: domCandidate.characterServerId,
+          displayText: name
+        };
+      }
+    }
+    const missing = names.filter((name) => !resolved[normalizeNativeCharacterName(name)]);
+    if (missing.length) {
+      const fetched = await fetchNativeCharacterRowsByName(missing);
+      for (const name of missing) {
+        const key = normalizeNativeCharacterName(name);
+        const rows = fetched[key] || [];
+        diagnostics[key] = { ...(diagnostics[key] || { name }), projectRows: rows };
+        if (rows.length !== 1) continue;
+        resolved[key] = {
+          id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+          type: "AT_TAG_TYPE",
+          children: [{ text: "@" }],
+          characterServerId: rows[0].characterServerId,
+          displayText: rows[0].displayText || name
+        };
+      }
+    }
+    return {
+      resolved,
+      diagnostics,
+      matchedNames: names.filter((name) => Boolean(resolved[normalizeNativeCharacterName(name)])),
+      unresolvedNames: names.filter((name) => !resolved[normalizeNativeCharacterName(name)])
+    };
+  }
+
+  function nativeCharacterIngredientSnapshot(store = resolvePromptStore()) {
+    const state = store?.getState?.() || {};
+    return (Array.isArray(state.ingredients) ? state.ingredients : [])
+      .filter((ingredient) => String(ingredient?.type || "").toUpperCase() === "CHARACTER" || ingredient?.characterServerId)
+      .map((ingredient) => ({
+        characterServerId: String(ingredient?.characterServerId || "").trim(),
+        ingredientId: String(ingredient?.ingredientId || "").trim(),
+        preferredIngredientType: String(ingredient?.preferredIngredientType || "").trim(),
+        isLoading: Boolean(ingredient?.isLoading)
+      }))
+      .filter((ingredient) => ingredient.characterServerId);
+  }
+
+  async function syncNativeCharacterIngredients(resolved = {}) {
+    const expectedIds = [...new Set(Object.values(resolved)
+      .map((node) => String(node?.characterServerId || "").trim())
+      .filter(Boolean))];
+    if (!expectedIds.length) {
+      return { attempted: false, ok: true, expectedIds: [], characterIngredients: [] };
+    }
+    const store = resolvePromptStore();
+    const actions = store?.getState?.()?.actions || {};
+    if (typeof actions.addCharacterIngredient !== "function" || typeof actions.clearCharacterServerIds !== "function") {
+      return {
+        attempted: true,
+        ok: false,
+        error: "NATIVE_CHARACTER_INGREDIENT_ACTION_MISSING",
+        expectedIds,
+        characterIngredients: nativeCharacterIngredientSnapshot(store)
+      };
+    }
+    try {
+      actions.clearCharacterServerIds();
+      expectedIds.forEach((characterServerId) => {
+        actions.addCharacterIngredient({ characterServerId });
+      });
+      await sleep(80);
+      const characterIngredients = nativeCharacterIngredientSnapshot(store);
+      const missingIds = expectedIds.filter((expectedId) =>
+        !characterIngredients.some((ingredient) => idsMatch(ingredient.characterServerId, expectedId))
+      );
+      return {
+        attempted: true,
+        ok: missingIds.length === 0,
+        error: missingIds.length ? "NATIVE_CHARACTER_INGREDIENT_NOT_BOUND" : "",
+        expectedIds,
+        missingIds,
+        characterIngredients
+      };
+    } catch (error) {
+      return {
+        attempted: true,
+        ok: false,
+        error: String(error?.message || error || "native_character_ingredient_sync_failed"),
+        expectedIds,
+        characterIngredients: nativeCharacterIngredientSnapshot(store)
+      };
+    }
+  }
+
+  function buildSlatePromptNodesWithNativeCharacters(value = "", resolved = {}) {
+    const pattern = /@[\s\u00a0]*([A-Za-z0-9][A-Za-z0-9_-]{1,63})/g;
+    const boundNativeCharacterKeys = new Set();
+    const cloneMention = (node) => ({
+      ...JSON.parse(JSON.stringify(node)),
+      id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`
+    });
+    return String(value || "").split("\n").map((line) => {
+      const children = [];
+      let last = 0;
+      let match;
+      pattern.lastIndex = 0;
+      while ((match = pattern.exec(line))) {
+        const key = normalizeNativeCharacterName(match[1]);
+        const mention = resolved[key];
+        if (!mention?.characterServerId || boundNativeCharacterKeys.has(key)) continue;
+        if (match.index > last) children.push({ text: line.slice(last, match.index) });
+        children.push(cloneMention(mention));
+        boundNativeCharacterKeys.add(key);
+        last = match.index + match[0].length;
+      }
+      if (last < line.length) children.push({ text: line.slice(last) });
+      if (!children.length) children.push({ text: "" });
+      return {
+        id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+        type: "PARAGRAPH",
+        children
+      };
+    });
+  }
+
+  function nativeCharacterCounts(children = []) {
+    const counts = {};
+    const walk = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (node.type === "AT_TAG_TYPE" && node.characterServerId && node.displayText) {
+        counts[node.displayText] = (counts[node.displayText] || 0) + 1;
+      }
+      if (Array.isArray(node.children)) node.children.forEach(walk);
+    };
+    children.forEach(walk);
+    return counts;
+  }
+
+  async function setSlateEditorTextWithNativeCharacters(element, value) {
+    const editor = findSlateEditorObject(element);
+    if (!editor || typeof editor.apply !== "function") return { attempted: false, persisted: "" };
+    const target = String(value || "");
+    const names = extractNativeCharacterMentionNames(target);
+    if (!names.length) return { attempted: false, persisted: "" };
+    const resolution = await resolveNativeCharacterMentionNodes(names);
+    if (!resolution.matchedNames.length || resolution.unresolvedNames.length) {
+      return {
+        attempted: true,
+        ok: false,
+        persisted: "",
+        error: "NATIVE_CHARACTER_MENTIONS_UNRESOLVED",
+        nativeCharacterMentions: {
+          requestedNames: names,
+          matchedNames: resolution.matchedNames,
+          unresolvedNames: resolution.unresolvedNames,
+          diagnostics: resolution.diagnostics
+        }
+      };
+    }
+    const ingredientSync = await syncNativeCharacterIngredients(resolution.resolved);
+    if (!ingredientSync.ok) {
+      return {
+        attempted: true,
+        ok: false,
+        persisted: "",
+        error: ingredientSync.error || "NATIVE_CHARACTER_INGREDIENT_NOT_BOUND",
+        nativeCharacterMentions: {
+          requestedNames: names,
+          matchedNames: resolution.matchedNames,
+          unresolvedNames: resolution.unresolvedNames,
+          diagnostics: resolution.diagnostics
+        },
+        nativeCharacterIngredientSync: ingredientSync
+      };
+    }
+    try {
+      const nodes = buildSlatePromptNodesWithNativeCharacters(target, resolution.resolved);
+      while (Array.isArray(editor.children) && editor.children.length) {
+        editor.apply({ type: "remove_node", path: [0], node: editor.children[0] });
+      }
+      nodes.forEach((node, index) => editor.apply({ type: "insert_node", path: [index], node }));
+      const lastPath = [Math.max(0, nodes.length - 1), Math.max(0, (nodes[nodes.length - 1]?.children || []).length - 1)];
+      const lastNode = editor.children?.[lastPath[0]]?.children?.[lastPath[1]];
+      const point = {
+        path: lastPath,
+        offset: typeof lastNode?.text === "string" ? lastNode.text.length : 0
+      };
+      if (typeof editor.select === "function") editor.select({ anchor: point, focus: point });
+      else editor.selection = { anchor: point, focus: point };
+      if (typeof editor.normalize === "function") editor.normalize({ force: true });
+      if (typeof editor.onChange === "function") editor.onChange();
+      await sleep(120);
+      const persisted = slatePromptText(editor.children);
+      const counts = nativeCharacterCounts(editor.children || []);
+      const ok = normalizeMentionPromptForCompare(persisted) === normalizeMentionPromptForCompare(target);
+      return {
+        attempted: true,
+        ok,
+        persisted,
+        counts,
+        nativeCharacterIngredientSync: ingredientSync,
+        nativeCharacterMentions: {
+          requestedNames: names,
+          matchedNames: resolution.matchedNames,
+          unresolvedNames: resolution.unresolvedNames,
+          diagnostics: resolution.diagnostics
+        }
+      };
+    } catch (error) {
+      return {
+        attempted: true,
+        ok: false,
+        persisted: slatePromptText(editor.children || []),
+        error: String(error?.message || error || "native_character_slate_insert_failed"),
+        nativeCharacterIngredientSync: ingredientSync,
+        nativeCharacterMentions: {
+          requestedNames: names,
+          matchedNames: resolution.matchedNames,
+          unresolvedNames: resolution.unresolvedNames,
+          diagnostics: resolution.diagnostics
+        }
+      };
+    }
   }
 
   async function setSlateEditorText(element, value) {
@@ -2600,12 +3000,31 @@
     await sleep(150);
   }
 
-	  async function setPromptEditorText(element, text) {
+	  async function setPromptEditorText(element, text, options = {}) {
 	    const value = String(text || "");
     const visiblePromptMatches = () => {
       if (!value.trim()) return !compactPromptForCompare(editorText(element));
       return compactPromptForCompare(editorText(element)) === compactPromptForCompare(value);
     };
+    const nativeCharacterSet = options.allowNativeCharacters === true
+      ? await setSlateEditorTextWithNativeCharacters(element, value)
+      : { attempted: false, persisted: "" };
+    if (nativeCharacterSet.attempted && nativeCharacterSet.ok) {
+      const inputMark = markComposerReceivedUserInput(element);
+      await notifyPromptEditorChanged(element, value);
+      return {
+        ok: true,
+        persisted: editorText(element) || nativeCharacterSet.persisted || "",
+        storePersisted: promptStoreSemanticText() || promptStoreText(),
+        slatePersisted: nativeCharacterSet.persisted || "",
+        slateAttempted: true,
+        storeAttempted: false,
+        receivedUserInput: inputMark,
+        method: "slateEditor.nativeCharacterNodes",
+        nativeCharacterMentions: nativeCharacterSet.nativeCharacterMentions || null,
+        nativeCharacterIngredientSync: nativeCharacterSet.nativeCharacterIngredientSync || null
+      };
+    }
     const slateSet = await setSlateEditorText(element, value);
     if (slateSet.attempted && String(slateSet.persisted || "").trim() === value.trim()) {
       const storePersistedAfterSlate = promptStoreText();
@@ -2623,7 +3042,13 @@
           slateAttempted: true,
           storeAttempted: storeSet.attempted === true,
           receivedUserInput: inputMark,
-          method: "slateEditor.insertText"
+          method: "slateEditor.insertText",
+          nativeCharacterFallback: nativeCharacterSet.attempted ? {
+            attempted: true,
+            ok: false,
+            error: nativeCharacterSet.error || "",
+            nativeCharacterMentions: nativeCharacterSet.nativeCharacterMentions || null
+          } : null
         };
       }
     }
@@ -2640,7 +3065,13 @@
           slateAttempted: slateSet.attempted === true,
           storeAttempted: true,
           receivedUserInput: inputMark,
-          method: "promptStore.setPrompt+receivedUserInput"
+          method: "promptStore.setPrompt+receivedUserInput",
+          nativeCharacterFallback: nativeCharacterSet.attempted ? {
+            attempted: true,
+            ok: false,
+            error: nativeCharacterSet.error || "",
+            nativeCharacterMentions: nativeCharacterSet.nativeCharacterMentions || null
+          } : null
         };
       }
     }
@@ -2673,6 +3104,12 @@
           slateAttempted: slateSet.attempted === true,
           storeAttempted: storeSet.attempted === true,
           method: "legacyExecCommand",
+          nativeCharacterFallback: nativeCharacterSet.attempted ? {
+            attempted: true,
+            ok: false,
+            error: nativeCharacterSet.error || "",
+            nativeCharacterMentions: nativeCharacterSet.nativeCharacterMentions || null
+          } : null,
           error: "PROMPT_EXEC_COMMAND_DID_NOT_INSERT"
         };
       }
@@ -2692,7 +3129,13 @@
       slateAttempted: slateSet.attempted === true,
       storeAttempted: storeSet.attempted === true,
       receivedUserInput: inputMark,
-      method: "legacyExecCommand"
+      method: "legacyExecCommand",
+      nativeCharacterFallback: nativeCharacterSet.attempted ? {
+        attempted: true,
+        ok: false,
+        error: nativeCharacterSet.error || "",
+        nativeCharacterMentions: nativeCharacterSet.nativeCharacterMentions || null
+      } : null
 	    };
 	  }
 
@@ -3077,12 +3520,44 @@
     };
   }
 
+  function detectFlowBlockingPage() {
+    const text = visibleText(document.body).slice(0, 600);
+    if (/number of requests sent exceeds the quota limit/i.test(text) || /error code\s*253/i.test(text)) {
+      return {
+        blocked: true,
+        code: "flow_quota_253",
+        class: "rate_limit",
+        retryable: true,
+        message: "The number of requests sent exceeds the quota limit. Error code 253",
+        textPreview: text
+      };
+    }
+    if (/aw,\s*snap!?/i.test(text) || /something went wrong while displaying this webpage/i.test(text) || /error code:\s*[a-z0-9_-]+/i.test(text)) {
+      const errorCode = text.match(/error code:\s*([a-z0-9_-]+)/i)?.[1] || "";
+      return {
+        blocked: true,
+        code: "flow_renderer_crashed",
+        class: "flow_renderer_crashed",
+        retryable: true,
+        healAction: "recover_flow_page",
+        errorCode,
+        message: `Flow page crashed${errorCode ? ` with Error code: ${errorCode}` : ""}`,
+        textPreview: text
+      };
+    }
+    return {
+      blocked: false,
+      textPreview: text
+    };
+  }
+
   function composerReadySnapshot(task = {}) {
     const editor = findPromptEditor();
     const create = resolveComposerCreateElement() || resolveDomActionElement("composer", "create");
     const settingsTrigger = findComposerSettingsTrigger();
     const store = resolvePromptStore();
     const bodyText = visibleText(document.body).slice(0, 320);
+    const flowPageIssue = detectFlowBlockingPage();
     const skeletonLoading = flowProjectSkeletonLoadingVisible();
     const flowLoading = /^L\s*o\s*a\s*d\s*i\s*n\s*g\s*(?:…|\.\.\.)?$/i.test(bodyText)
       || /^Loading(?:…|\.\.\.)?$/i.test(bodyText);
@@ -3091,6 +3566,7 @@
     const createRect = domRectSummary(createElement);
     const settingsRect = domRectSummary(settingsTrigger);
     const problems = [];
+    if (flowPageIssue.blocked) problems.push(flowPageIssue.code || "flow_page_blocked");
     if (flowLoading || skeletonLoading.visible) problems.push("flow_loading");
     if (/\/archive(?:[/?#]|$)/i.test(location.pathname || "")) problems.push("flow_archive_view");
     if (!editor) problems.push("editor_missing");
@@ -3120,6 +3596,7 @@
       settingsText: settingsTrigger ? visibleText(settingsTrigger) : "",
       settingsHit: settingsTrigger ? elementCenterHitSummary(settingsTrigger) : null,
       bodyTextPreview: bodyText,
+      flowPageIssue,
       flowLoading,
       skeletonLoading,
       trace: summarizeDomAutomationTrace(task)
@@ -3168,7 +3645,9 @@
     return {
       ok: false,
       action: "waitForComposerReadyForDebugger",
-      error: `${(last?.problems || []).includes("flow_loading") ? "FLOW_PAGE_LOADING:" : ""}COMPOSER_NOT_READY:${(last?.problems || ["unknown"]).join(",")}`,
+      error: last?.flowPageIssue?.blocked
+        ? `${last.flowPageIssue.code === "flow_renderer_crashed" ? "FLOW_RENDERER_CRASHED" : "FLOW_RATE_LIMIT_253"}:${last.flowPageIssue.message || last.flowPageIssue.textPreview || "Flow page blocked"}`
+        : `${(last?.problems || []).includes("flow_loading") ? "FLOW_PAGE_LOADING:" : ""}COMPOSER_NOT_READY:${(last?.problems || ["unknown"]).join(",")}`,
       stableCount,
       snapshot: last
     };
@@ -9660,7 +10139,7 @@
         emitDomStage("prompt_character_injection_start");
         
         // Step 1: Clear existing content
-        await setPromptEditorText(editor, "");
+        await setPromptEditorText(editor, "", { allowNativeCharacters: false });
         
         // Step 2: Use the sequential typing flow
         const typeResult = await typePromptWithInlineCharacterChips(task, emitDomStage);
@@ -9682,7 +10161,7 @@
           trace: true
         });
       } else {
-        commit = await setPromptEditorText(editor, prompt);
+        commit = await setPromptEditorText(editor, prompt, { allowNativeCharacters: mode === "text-to-image" });
         emitDomStage("prompt_commit", {
           ok: Boolean(commit.ok),
           persisted: commit.persisted || "",
@@ -9727,7 +10206,7 @@
           };
         }
 
-        const recommit = await setPromptEditorText(editor, prompt);
+        const recommit = await setPromptEditorText(editor, prompt, { allowNativeCharacters: mode === "text-to-image" });
         emitDomStage("prompt_recommit", {
           ok: Boolean(recommit.ok),
           persisted: recommit.persisted || "",
@@ -10227,7 +10706,7 @@
     if (!prompt) return { ok: false, action: "domCommitPromptForDebugger", error: "DOM_PROMPT_EMPTY" };
     const editor = findPromptEditor();
     if (!editor) return { ok: false, action: "domCommitPromptForDebugger", error: "DOM_PROMPT_EDITOR_NOT_FOUND" };
-    const commit = await setPromptEditorText(editor, prompt);
+    const commit = await setPromptEditorText(editor, prompt, { allowNativeCharacters: String(task.mode || "") === "text-to-image" });
     const create = resolveComposerCreateElement(editor) || resolveDomActionElement("composer", "create");
     const domTrace = summarizeDomAutomationTrace(task);
     return {
@@ -10251,7 +10730,7 @@
     const editor = findPromptEditor();
     if (!editor) return { ok: false, action: "domClearPromptAfterDebuggerSubmit", error: "DOM_PROMPT_EDITOR_NOT_FOUND" };
     const before = editorText(editor);
-    const clear = await setPromptEditorText(editor, "");
+    const clear = await setPromptEditorText(editor, "", { allowNativeCharacters: false });
     await sleep(120);
     const frameSlotClears = [];
     if (["image-to-video", "start-end-image-to-video"].includes(String(task.mode || ""))) {

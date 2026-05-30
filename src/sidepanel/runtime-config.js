@@ -56,6 +56,8 @@ export function createDefaultState(now = new Date().toISOString()) {
       pageHookVersion: "",
       pageHookInstalled: false,
       hasNativeFetch: false,
+      flowPageBlocked: false,
+      flowPageIssue: null,
       bridgeError: null,
       error: null,
       lastSyncAt: null
@@ -63,6 +65,10 @@ export function createDefaultState(now = new Date().toISOString()) {
     control: {
       mode: FLOW_MODES.imageToVideo,
       livePrompt: "",
+      characterPromptText: "",
+      promptTab: "workflow_prompts",
+      referencesTab: "prompt_references",
+      runMappingTab: "prompt_mapping",
       wizardStep: 1,
       lastRunError: "",
       promptMapOpen: false,
@@ -71,6 +77,7 @@ export function createDefaultState(now = new Date().toISOString()) {
       oneToOneBatchRefIds: [],
       transientReferenceItems: [],
       saveUploadsToLibrary: false,
+      characterSources: {},
       autopilotPendingBatch: null,
       references: {
         imagePromptRefs: "",
@@ -163,6 +170,18 @@ export function createDefaultState(now = new Date().toISOString()) {
       savedItems: [],
       lastSyncedAt: null
     },
+    characters: {
+      storeInFlow: false,
+      voiceCatalog: {
+        capturedAt: "",
+        accountTier: "",
+        voiceCount: 0,
+        voices: [],
+        catalogHash: ""
+      },
+      assets: [],
+      savedMappings: []
+    },
     history: {
       runs: []
     },
@@ -243,6 +262,16 @@ export function mergeState(base, incoming) {
   }
 
   output.control.livePrompt = String(output.control.livePrompt || "");
+  output.control.characterPromptText = String(output.control.characterPromptText || "");
+  output.control.promptTab = ["workflow_prompts", "character_prompts"].includes(output.control.promptTab)
+    ? output.control.promptTab
+    : "workflow_prompts";
+  output.control.referencesTab = ["prompt_references", "character_sources"].includes(output.control.referencesTab)
+    ? output.control.referencesTab
+    : "prompt_references";
+  output.control.runMappingTab = ["prompt_mapping", "character_mapping"].includes(output.control.runMappingTab)
+    ? output.control.runMappingTab
+    : "prompt_mapping";
   output.control.wizardStep = clampInt(output.control.wizardStep, 1, 3, 1);
   output.control.promptMapOpen = Boolean(output.control.promptMapOpen);
   output.control.promptMapFullscreen = Boolean(output.control.promptMapFullscreen);
@@ -252,6 +281,7 @@ export function mergeState(base, incoming) {
     ? output.control.transientReferenceItems.slice(0, 100)
     : [];
   output.control.saveUploadsToLibrary = output.control.saveUploadsToLibrary === true;
+  output.control.characterSources = normalizeCharacterSources(output.control.characterSources);
   output.control.presets = normalizePresets(output.control.presets, Number(incoming.version || 0), incoming.control?.presets || {});
   output.control.references = normalizeReferences(output.control.references);
   output.queue.items = Array.isArray(output.queue.items) ? output.queue.items : [];
@@ -269,6 +299,7 @@ export function mergeState(base, incoming) {
   output.referenceLibrary.savedItems = Array.isArray(output.referenceLibrary.savedItems)
     ? output.referenceLibrary.savedItems.slice(0, 100)
     : [];
+  output.characters = normalizeCharacters(output.characters);
   output.history = normalizeHistory(output.history);
   output.account = normalizeAccount(output.account);
   return output;
@@ -392,6 +423,52 @@ function normalizeReferences(refs = {}) {
   );
 }
 
+function normalizeCharacterSources(value = {}) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return Object.fromEntries(Object.entries(source).slice(0, 100).map(([handle, entry]) => {
+    const item = entry && typeof entry === "object" ? entry : {};
+    return [String(handle || "").trim().toLowerCase(), {
+      sourceMode: ["generate_from_description", "uploaded_image", "reference_library", "existing_flow_character", "saved_flow_character", "unset"].includes(item.sourceMode)
+        ? item.sourceMode
+        : "generate_from_description",
+      sourceRefId: String(item.sourceRefId || ""),
+      sourceMediaId: String(item.sourceMediaId || ""),
+      flowCharacterId: String(item.flowCharacterId || ""),
+      requestedVoice: String(item.requestedVoice || ""),
+      resolvedVoiceName: String(item.resolvedVoiceName || ""),
+      additionalInfo: String(item.additionalInfo || ""),
+      status: String(item.status || "")
+    }];
+  }).filter(([handle]) => handle));
+}
+
+function normalizeCharacters(characters = {}) {
+  const source = characters && typeof characters === "object" ? characters : {};
+  const voiceCatalogSource = source.voiceCatalog && typeof source.voiceCatalog === "object" ? source.voiceCatalog : {};
+  const voices = Array.isArray(voiceCatalogSource.voices)
+    ? voiceCatalogSource.voices.slice(0, 100).map((voice) => ({
+        displayName: String(voice?.displayName || voice?.name || ""),
+        normalizedName: String(voice?.normalizedName || ""),
+        description: String(voice?.description || ""),
+        flowVoiceId: String(voice?.flowVoiceId || voice?.id || ""),
+        previewAvailable: Boolean(voice?.previewAvailable),
+        selector: String(voice?.selector || "")
+      })).filter((voice) => voice.displayName)
+    : [];
+  return {
+    storeInFlow: source.storeInFlow === true,
+    voiceCatalog: {
+      capturedAt: String(voiceCatalogSource.capturedAt || ""),
+      accountTier: String(voiceCatalogSource.accountTier || ""),
+      voiceCount: Number.isFinite(Number(voiceCatalogSource.voiceCount)) ? Number(voiceCatalogSource.voiceCount) : voices.length,
+      voices,
+      catalogHash: String(voiceCatalogSource.catalogHash || "")
+    },
+    assets: Array.isArray(source.assets) ? source.assets.slice(0, 200).filter((asset) => asset && typeof asset === "object") : [],
+    savedMappings: Array.isArray(source.savedMappings) ? source.savedMappings.slice(0, 100).filter((mapping) => mapping && typeof mapping === "object") : []
+  };
+}
+
 function normalizeHistory(history = {}) {
   const runs = Array.isArray(history?.runs) ? history.runs : [];
   return {
@@ -432,6 +509,10 @@ function normalizeHistoryControl(control = {}) {
   return {
     mode: Object.values(FLOW_MODES).includes(control?.mode) ? control.mode : base.mode,
     livePrompt: String(control?.livePrompt || ""),
+    characterPromptText: String(control?.characterPromptText || ""),
+    promptTab: ["workflow_prompts", "character_prompts"].includes(control?.promptTab) ? control.promptTab : base.promptTab,
+    referencesTab: ["prompt_references", "character_sources"].includes(control?.referencesTab) ? control.referencesTab : base.referencesTab,
+    runMappingTab: ["prompt_mapping", "character_mapping"].includes(control?.runMappingTab) ? control.runMappingTab : base.runMappingTab,
     wizardStep: clampInt(control?.wizardStep, 1, 3, 1),
     lastRunError: String(control?.lastRunError || ""),
     promptMapOpen: Boolean(control?.promptMapOpen),
@@ -439,6 +520,7 @@ function normalizeHistoryControl(control = {}) {
     promptRefMap: normalizePromptRefMap(control?.promptRefMap || {}),
     oneToOneBatchRefIds: normalizeIdArray(control?.oneToOneBatchRefIds || []),
     references: refs,
+    characterSources: normalizeCharacterSources(control?.characterSources || {}),
     activeApplyMode: String(control?.activeApplyMode || "shared"),
     presets: normalizePresets(control?.presets || {}, 4, control?.presets || {})
   };

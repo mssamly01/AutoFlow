@@ -3,7 +3,7 @@ import { createChromeStorageAdapter, createLicenseClient } from "../core/auth/li
 import { createFlowClient, extractMediaIds } from "../core/media/flow-client.js";
 import { createPageFlowTransport } from "../core/media/page-flow-transport.js";
 import { createTaskLedger, sanitizeTaskForDebugReport, TaskStatus } from "../core/queue/task-ledger.js";
-import { createScheduler } from "../core/queue/scheduler.js";
+import { createScheduler, detectFlowRendererCrashSnapshot, flowRendererCrashErrorCode, isFlowRendererCrashText } from "../core/queue/scheduler.js";
 import { createQueueExecutor } from "../core/queue/executor.js";
 import { buildContinuityRefPatch } from "../core/queue/continuity-chain.js";
 import { activeVideoTaskBeforeComposerRetry } from "../core/queue/video-retry-policy.js";
@@ -21,6 +21,8 @@ const runtimeState = {
   projectId: "",
   pageUrl: "",
   pageTitle: "",
+  flowPageBlocked: false,
+  flowPageIssue: null,
   authEnvironment: null,
   auth: null,
   lastGalleryItems: [],
@@ -94,8 +96,15 @@ function startBackgroundDownloadDaemon() {
     }
   }, 10000); // Mỗi 10 giây (nhanh hơn)
 }
-const RECOVERABLE_GLOBAL_HEAL_ACTIONS = new Set(["cooldown_and_refresh", "reconnect_flow", "wait_for_capacity", "backoff"]);
+const RECOVERABLE_GLOBAL_HEAL_ACTIONS = new Set(["cooldown_and_refresh", "reconnect_flow", "wait_for_capacity", "backoff", "recover_flow_page"]);
 const MAX_GLOBAL_RECOVERY_ATTEMPTS = 4;
+const MAX_FLOW_RENDERER_CRASH_RECOVERY_ATTEMPTS = 2;
+const FLOW_RENDERER_CRASH_RECOVERY_LEVELS = Object.freeze(["soft_reload", "cache_clear_reload"]);
+const flowRendererCrashRecoveryState = {
+  lastDetectedAt: 0,
+  lastRecoveredAt: 0,
+  lastIssue: null
+};
 const licenseClient = createLicenseClient({
   storage: createChromeStorageAdapter(),
   environmentProvider: () => runtimeState.authEnvironment || {
@@ -3806,8 +3815,240 @@ function firstFlowMediaId(values = [], refs = []) {
     .find((mediaId) => mediaId && !localIds.has(mediaId)) || "";
 }
 
+function compactDiagnosticPreview(value = "", limit = 240) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function setFlowPageIssue(issue = null) {
+  runtimeState.flowPageBlocked = Boolean(issue);
+  runtimeState.flowPageIssue = issue || null;
+  flowRendererCrashRecoveryState.lastIssue = issue || null;
+  if (issue) flowRendererCrashRecoveryState.lastDetectedAt = Date.now();
+}
+
+async function snapshotFlowPageForCrash(tabId = 0, phase = "") {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const snapshot = {
+    url: compactString(tab?.url || ""),
+    title: compactString(tab?.title || ""),
+    bodyText: "",
+    readyState: "",
+    phase,
+    cdpError: ""
+  };
+  if (!tab?.id || !chrome.scripting?.executeScript) return snapshot;
+  try {
+    const frames = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: () => ({
+        href: String(location.href || ""),
+        title: String(document.title || ""),
+        readyState: String(document.readyState || ""),
+        bodyText: String(document.body?.innerText || document.documentElement?.innerText || "").slice(0, 4000)
+      })
+    });
+    const dom = frames?.[0]?.result || {};
+    snapshot.url = compactString(dom.href || snapshot.url);
+    snapshot.title = compactString(dom.title || snapshot.title);
+    snapshot.bodyText = compactString(dom.bodyText || "");
+    snapshot.readyState = compactString(dom.readyState || "");
+  } catch (error) {
+    snapshot.cdpError = compactErrorText(error, "flow_page_snapshot_failed");
+  }
+  return snapshot;
+}
+
+async function detectFlowRendererCrashForTask(task = {}, tabId = 0, phase = "") {
+  const snapshot = await snapshotFlowPageForCrash(tabId, phase);
+  const detected = detectFlowRendererCrashSnapshot(snapshot);
+  if (!detected.crashed) return { ...detected, snapshot, taskId: task?.id || "", phase };
+  const issue = {
+    class: "flow_renderer_crashed",
+    phase,
+    taskId: task?.id || "",
+    errorCode: detected.errorCode || flowRendererCrashErrorCode(snapshot.cdpError || snapshot.bodyText || snapshot.title),
+    textPreview: detected.textPreview || compactDiagnosticPreview(snapshot.bodyText || snapshot.title || snapshot.cdpError),
+    url: snapshot.url || ""
+  };
+  setFlowPageIssue(issue);
+  recordEvent({
+    type: "queue.flow_renderer_crash.detected",
+    taskId: issue.taskId,
+    phase,
+    errorCode: issue.errorCode,
+    textPreview: issue.textPreview,
+    url: issue.url
+  });
+  return { ...detected, snapshot, taskId: issue.taskId, phase, issue };
+}
+
+async function markFlowRendererCrashDetected(task = {}, detection = {}, phase = "") {
+  if (!task?.id) return null;
+  const message = [
+    "FLOW_RENDERER_CRASHED",
+    detection?.errorCode ? `error code: ${detection.errorCode}` : "",
+    detection?.textPreview || detection?.issue?.textPreview || ""
+  ].filter(Boolean).join(" ");
+  const patch = {
+    status: TaskStatus.blocked,
+    lastError: message,
+    failureClass: "flow_renderer_crashed",
+    healAction: "recover_flow_page",
+    failureScope: "global",
+    rendererCrashDetectedAt: new Date().toISOString(),
+    rendererCrashPhase: phase || detection?.phase || "",
+    rendererCrashErrorCode: detection?.errorCode || detection?.issue?.errorCode || "",
+    completedAt: new Date().toISOString()
+  };
+  const blocked = ledger.updateTask(task.id, patch);
+  await persistQueueState();
+  return blocked;
+}
+
+function taskTriggersFlowRendererCrashRecovery(task = {}) {
+  return task?.failureClass === "flow_renderer_crashed"
+    || task?.healAction === "recover_flow_page"
+    || isFlowRendererCrashText(task?.lastError || "");
+}
+
+async function maybeMarkFlowRendererCrashFromCurrentTab(task = {}, tabId = 0, phase = "") {
+  if (!task?.id) return task;
+  if (taskTriggersFlowRendererCrashRecovery(task)) return task;
+  const detection = await detectFlowRendererCrashForTask(task, tabId, phase);
+  if (!detection.crashed) return task;
+  return markFlowRendererCrashDetected(task, detection, phase);
+}
+
+async function clearFlowRendererCrashCache() {
+  if (!chrome.browsingData?.remove) {
+    return { ok: false, error: "browsingData_unavailable" };
+  }
+  await chrome.browsingData.remove(
+    { origins: FLOW_ORIGINS },
+    {
+      cache: true,
+      cacheStorage: true
+    }
+  );
+  return { ok: true };
+}
+
+async function recoverFlowRendererCrashGlobalFailure(task = {}, tabId = 0) {
+  if (!task?.id) return { ok: false, error: "missing_task" };
+  const attempts = Number(task.flowRendererCrashRecoveryAttempts || 0) + 1;
+  if (attempts > MAX_FLOW_RENDERER_CRASH_RECOVERY_ATTEMPTS) {
+    const blocked = ledger.updateTask(task.id, {
+      status: TaskStatus.blocked,
+      healAction: "user_action_required",
+      failureClass: "flow_renderer_crashed",
+      failureScope: "global",
+      lastError: task.lastError || "FLOW_RENDERER_CRASHED recovery exhausted",
+      completedAt: new Date().toISOString()
+    });
+    recordEvent({
+      type: "queue.flow_renderer_crash.recovery_exhausted",
+      taskId: task.id,
+      attempts
+    });
+    await persistQueueState();
+    return { ok: false, blocked };
+  }
+
+  const level = FLOW_RENDERER_CRASH_RECOVERY_LEVELS[Math.min(attempts - 1, FLOW_RENDERER_CRASH_RECOVERY_LEVELS.length - 1)];
+  recordEvent({
+    type: "queue.flow_renderer_crash.recovery_start",
+    taskId: task.id,
+    attempts,
+    level
+  });
+
+  let cacheClear = null;
+  if (level === "cache_clear_reload") {
+    cacheClear = await clearFlowRendererCrashCache().catch((error) => ({
+      ok: false,
+      error: compactErrorText(error, "flow_renderer_cache_clear_failed")
+    }));
+  }
+
+  const reload = await reloadFlowTab(tabId).catch((error) => ({
+    ok: false,
+    error: compactErrorText(error, "flow_renderer_reload_failed")
+  }));
+  const activeTabId = reload?.tabId || tabId;
+  await sleep(2500);
+
+  const projectId = compactString(task.projectId || runtimeState.projectId || projectIdFromUrl((await chrome.tabs.get(activeTabId).catch(() => null))?.url || ""));
+  let rootReady = { ok: true };
+  if (projectId && activeTabId) {
+    rootReady = await waitForFlowProjectRoot(activeTabId, projectId).catch((error) => ({
+      ok: false,
+      error: compactErrorText(error, "flow_project_root_after_crash_timeout")
+    }));
+  }
+  const bridge = activeTabId
+    ? await ensureFlowBridge(activeTabId).catch((error) => ({
+      ok: false,
+      error: compactErrorText(error, "flow_bridge_after_crash_failed")
+    }))
+    : { ok: false, error: "flow_tab_not_found" };
+
+  const ok = reload?.ok === true && (rootReady?.ok !== false) && bridge?.ok === true;
+  const patch = {
+    flowRendererCrashRecoveryAttempts: attempts,
+    lastFlowRendererCrashRecoveryLevel: level,
+    lastHealReloadOk: reload?.ok === true,
+    lastHealBridgeOk: bridge?.ok === true
+  };
+  if (cacheClear) patch.lastHealCacheClearOk = cacheClear.ok === true;
+
+  if (ok) {
+    ledger.updateTask(task.id, {
+      ...patch,
+      status: TaskStatus.pending,
+      healAction: "",
+      failureScope: "",
+      failureClass: "",
+      completedAt: "",
+      nextRetryAt: "",
+      lastError: ""
+    });
+    setFlowPageIssue(null);
+    flowRendererCrashRecoveryState.lastRecoveredAt = Date.now();
+  } else {
+    ledger.updateTask(task.id, {
+      ...patch,
+      status: TaskStatus.blocked,
+      healAction: "recover_flow_page",
+      failureScope: "global",
+      failureClass: "flow_renderer_crashed",
+      lastError: compactDiagnosticPreview([
+        task.lastError || "FLOW_RENDERER_CRASHED",
+        reload?.error,
+        rootReady?.error,
+        bridge?.error
+      ].filter(Boolean).join(" ")),
+      completedAt: new Date().toISOString()
+    });
+  }
+
+  recordEvent({
+    type: ok ? "queue.flow_renderer_crash.recovery_done" : "queue.flow_renderer_crash.recovery_failed",
+    taskId: task.id,
+    attempts,
+    level,
+    reloadOk: reload?.ok === true,
+    rootReadyOk: rootReady?.ok !== false,
+    bridgeOk: bridge?.ok === true,
+    cacheClearOk: cacheClear ? cacheClear.ok === true : null,
+    error: ok ? "" : compactDiagnosticPreview([reload?.error, rootReady?.error, bridge?.error].filter(Boolean).join(" "))
+  });
+  await persistQueueState();
+  return { ok, task: ledger.getTask(task.id) };
+}
+
 function isRecoverableGlobalTask(task = {}) {
-  return task?.status === TaskStatus.pending
+  return [TaskStatus.pending, TaskStatus.blocked].includes(task?.status)
     && task?.failureScope === "global"
     && RECOVERABLE_GLOBAL_HEAL_ACTIONS.has(String(task?.healAction || ""));
 }
@@ -3823,6 +4064,10 @@ function globalRecoveryDelayMs(task = {}) {
 }
 
 async function recoverGlobalQueueFailure(task = {}, tabId = 0) {
+  const effectiveTask = await maybeMarkFlowRendererCrashFromCurrentTab(task, tabId, "global_recovery").catch(() => task);
+  if (taskTriggersFlowRendererCrashRecovery(effectiveTask)) {
+    return recoverFlowRendererCrashGlobalFailure(effectiveTask, tabId);
+  }
   const recoveryAttempts = Number(task.globalRecoveryAttempts || 0) + 1;
   if (recoveryAttempts > MAX_GLOBAL_RECOVERY_ATTEMPTS) {
     const blocked = ledger.updateTask(task.id, {
@@ -4022,8 +4267,11 @@ function startTaskWatcher(taskId, tabId, options = {}) {
         error: errorText,
         stack: error?.stack || ""
       });
-      scheduler.markFailure(taskId, error);
+      const failed = scheduler.markFailure(taskId, error);
       await persistQueueState();
+      if (isRecoverableGlobalTask(failed)) {
+        await recoverGlobalQueueFailure(failed, tabId);
+      }
     } finally {
       activeWatchRuns.delete(taskId);
       if (options.pumpOnSettle !== false) pumpOverlapQueue(tabId);
@@ -4231,6 +4479,13 @@ function pumpOverlapQueue(tabId) {
         // Không markSubmitting ở đây.
         // executor.runTask() yêu cầu task còn pending và sẽ tự markSubmitting.
 
+        const rendererCrash = await detectFlowRendererCrashForTask(task, tabId, "overlap_before_submit");
+        if (rendererCrash.crashed) {
+          const blocked = await markFlowRendererCrashDetected(task, rendererCrash, "overlap_before_submit");
+          await recoverFlowRendererCrashGlobalFailure(blocked || task, tabId);
+          return;
+        }
+
         let result = await executor.runTask(task.id, {
           submitOnly: true,
           overlap: true
@@ -4268,8 +4523,11 @@ function pumpOverlapQueue(tabId) {
           error: errorText
         });
 
-        scheduler.markFailure(task.id, error);
+        const failed = scheduler.markFailure(task.id, error);
         await persistQueueState();
+        if (isRecoverableGlobalTask(failed)) {
+          await recoverGlobalQueueFailure(failed, tabId);
+        }
       } finally {
         activeSubmitRuns.delete(task.id);
         pumpOverlapQueue(tabId);
@@ -4359,6 +4617,12 @@ function startManualOverlapQueueTask(taskId, preferredTabId, config = overlapCon
 
       const executor = createExecutorForTab(tab.id);
       const taskToRun = ledger.getTask(task.id) || task;
+      const rendererCrash = await detectFlowRendererCrashForTask(taskToRun, tab.id, "manual_overlap_before_submit");
+      if (rendererCrash.crashed) {
+        const blocked = await markFlowRendererCrashDetected(taskToRun, rendererCrash, "manual_overlap_before_submit");
+        await recoverFlowRendererCrashGlobalFailure(blocked || taskToRun, tab.id);
+        return;
+      }
       const result = await executor.runTask(taskToRun.id, {
         submitOnly: true,
         overlap: true
@@ -4394,8 +4658,11 @@ function startManualOverlapQueueTask(taskId, preferredTabId, config = overlapCon
         error: errorText,
         stack: error?.stack || ""
       });
-      scheduler.markFailure(id, error);
+      const failed = scheduler.markFailure(id, error);
       await persistQueueState();
+      if (isRecoverableGlobalTask(failed)) {
+        await recoverGlobalQueueFailure(failed, preferredTabId);
+      }
     } finally {
       activeSubmitRuns.delete(id);
       if (shouldSettleOnSubmitFinish) {
@@ -4558,6 +4825,13 @@ async function runQueueUntilIdle(preferredTabId) {
         await persistQueueState();
         if (!isActiveRun()) break;
         const taskToRun = ledger.getTask(nextTask.id) || nextTask;
+        const rendererCrash = await detectFlowRendererCrashForTask(taskToRun, tab.id, "before_submit");
+        if (rendererCrash.crashed) {
+          const blocked = await markFlowRendererCrashDetected(taskToRun, rendererCrash, "before_submit");
+          const recovery = await recoverFlowRendererCrashGlobalFailure(blocked || taskToRun, tab.id);
+          if (!recovery.ok) break;
+          continue;
+        }
         const submitOnlyVideos = taskMediaKind(taskToRun) === "videos";
         
         // Bắt đầu overlap timer NGAY khi task khởi động, để timer đo thời gian
@@ -4726,6 +5000,12 @@ function runSingleQueueTask(taskId, preferredTabId) {
 
       const executor = createExecutorForTab(tab.id);
       const taskToRun = ledger.getTask(taskId) || task;
+      const rendererCrash = await detectFlowRendererCrashForTask(taskToRun, tab.id, "single_task_before_submit");
+      if (rendererCrash.crashed) {
+        const blocked = await markFlowRendererCrashDetected(taskToRun, rendererCrash, "single_task_before_submit");
+        await recoverFlowRendererCrashGlobalFailure(blocked || taskToRun, tab.id);
+        return;
+      }
       const submitOnlyVideos = taskMediaKind(taskToRun) === "videos";
       let resultTask = await executor.runTask(taskToRun.id, { submitOnlyVideos });
       if (!isActiveRun()) return;
@@ -4773,6 +5053,9 @@ function runSingleQueueTask(taskId, preferredTabId) {
           failureScope: task?.failureScope || "",
           healAction: task?.healAction || ""
         });
+        if (isRecoverableGlobalTask(task)) {
+          await recoverGlobalQueueFailure(task, preferredTabId);
+        }
       }
     } finally {
       stopOverlapTimerIfIdle();
@@ -5171,6 +5454,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           projectId,
           pageUrl: binding.pageUrl || tab?.url || "",
           pageTitle: binding.pageTitle || tab?.title || "",
+          flowPageBlocked: runtimeState.flowPageBlocked === true,
+          flowPageIssue: runtimeState.flowPageIssue || null,
           ...bridgeFields,
           error: binding.activeTabId ? (projectId ? null : "missing_project_id") : "flow_tab_not_found",
           lastSyncAt: new Date().toISOString()
